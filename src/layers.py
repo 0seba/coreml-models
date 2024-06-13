@@ -125,24 +125,26 @@ class RMSNorm(NamedCall):
         )
         return mb.mul(x=x, y=rmsnorm_reciprocal, name=f"{prefix}_rmsnorm_normalized")
 
-    def __call__(self, x, name=None, w=None, axes=None):
+    def __call__(self, x, prefix=None, w=None, axes=None):
         if axes is None:
             axes = self.axes
-        dimroot = np.sum(x.shape[*axes]) ** 0.5
+        shape = x.shape
+        dims = [shape[i] for i in axes] # x.shape[*axes] does not work
+        dimroot = np.sqrt(np.prod(dims))
         if types.builtin_to_string(x.dtype) == "fp16":
             xnormed = RMSNorm.stable_low_precision_normalize(
-                x, self.eps, dimroot, name, axes
+                x, self.eps, dimroot, prefix, axes
             )
         else:
-            xnormed = RMSNorm.normalize(x, self.eps, name)
+            xnormed = RMSNorm.normalize(x, self.eps, dimroot, prefix, axes)
 
         w = self.w if w is None else w
         if w is not None:
-            return mb.mul(x=xnormed, y=w, name=f"{name}_rmsnorm")
+            return mb.mul(x=xnormed, y=w, name=f"{prefix}_rmsnorm")
         return xnormed
 
 
-class MLP:
+class FFN:
     def __init__(
         self,
         win: Linear,
@@ -164,19 +166,19 @@ class MLP:
             prefix = self.prefix
         if axis is None:
             axis = self.axis
-        x = self.win(x, name=f"{prefix}_mlp_inproj")
+        x = self.win(x, name=f"{prefix}_ffn_inproj")
         if self.is_glu:
             g, x = mb.split(
                 x=x,
                 num_splits=2,
                 axis=axis,
-                name=f"{prefix}_mlp_xg_split",
+                name=f"{prefix}_ffn_xg_split",
             )
-            g = self.activation(x=g, name=f"{prefix}_mlp_g_activation")
-            x = mb.mul(x=x, y=g, name=f"{prefix}_mlp_x_gated")
+            g = self.activation(x=g, name=f"{prefix}_ffn_g_activation")
+            x = mb.mul(x=x, y=g, name=f"{prefix}_ffn_x_gated")
         else:
-            x = self.activation(x=x, name=f"{prefix}_mlp_x_activation")
-        x = self.wout(x, name=f"{prefix}_mlp_outproj")
+            x = self.activation(x=x, name=f"{prefix}_ffn_x_activation")
+        x = self.wout(x, name=f"{prefix}_ffn_outproj")
         return x
 
 class Head:
@@ -187,14 +189,14 @@ class Head:
         self,
         w: np.ndarray,
         split_size,
-        axis: int,
+        channels_first: bool,
         topk=0, # Seems that topk is not supported by ANE
         return_logits=True,
         cast=True,
         prefix=None,
     ):
-        self.w = w
-        self.axis = axis
+        self.w = w # has same shape as input embeddings, (vocab_size, hidden dim)
+        self.channels_first = channels_first
         self.nsplits = math.ceil(w.shape[0] / split_size)
         self.topk = topk
         # self.padsize = w.shape[0] - vocab_size
@@ -207,11 +209,14 @@ class Head:
         self.cast = cast
         self.prefix = prefix
 
-    def __call__(self, x, prefix=None, axis=None):
+    def __call__(self, x, prefix=None, channels_first=None):
         if prefix is None:
             prefix = self.prefix
-        if axis is None:
-            axis = self.axis
+        if channels_first is None:
+            channels_first = self.channels_first
+            axis = 2
+        else:
+            axis = 1
         ws = mb.split(
             x=self.w,
             split_sizes=self.split_sizes,
@@ -230,13 +235,14 @@ class Head:
         for i in range(len(self.split_sizes)):
             # for i in range(self.nsplits):
             w = ws[i]
-            if axis == 1:
-                w = mb.transpose(x=w, perm=[1, 0], name=f"prediction_head_{i}")
-                # transpose_y parameter does not work with big weights
-                logits_i = mb.matmul(x=x, y=w, transpose_y=False, name=f"logits_{i}")
-            else:
+            if channels_first:
                 w = mb.expand_dims(x=w, axes=[-1])
                 logits_i = mb.conv(x=x, weight=w, name=f"logits_{i}")
+            else:
+                w = mb.transpose(x=w, perm=[1, 0], name=f"prediction_head_{i}")
+                # transpose_y parameter does not work with big weights
+                # I think this could also be a linear
+                logits_i = mb.matmul(x=x, y=w, transpose_y=False, name=f"logits_{i}") 
             logits.append(logits_i)
 
             if self.topk > 0:
