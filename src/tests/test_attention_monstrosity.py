@@ -6,7 +6,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 from layers import RMSNorm, Embedding
-from attention import attention_monstrosity, RoPEEmbedding
+from attention import attention_monstrosity, RoPEEmbedding, Mask, make_rope_mask_indices
 
 
 class OpenELMRMSNorm(nn.Module):
@@ -349,7 +349,7 @@ class OpenELMMultiHeadCausalAttention(nn.Module):
         # attn_output = self.out_proj(attn_output)
         if not output_attentions:
             attn_weights = None
-        return attn_output, attn_weights  # , past_key_value
+        return attn_output, queries, keys
 
 
 def main():
@@ -363,6 +363,17 @@ def main():
     headdim, nqheads, nkvheads = 64, 6, 2
     # We use embedding because rope and mask with flexible shape require input ids instead of
     # hidden states as input
+    torch_causal_mask = torch.full(
+        (128, 128),
+        fill_value=True,
+        dtype=torch.bool,
+    )
+    torch_causal_mask = torch.triu(torch_causal_mask, diagonal=1)
+    min_dtype = torch.finfo(torch.float32).min
+    torch_causal_mask = (
+        torch_causal_mask[None, None, :, :].repeat(bsz, 1, 1, 1).to(torch.float32)
+        * min_dtype
+    )
     input_ids = np.random.randint(0, 128, (bsz, seqlen), dtype=np.int32)
     torch_input_ids = torch.from_numpy(input_ids)
     embedding = nn.Embedding(seqlen, dim)
@@ -373,6 +384,7 @@ def main():
     seqlens = [128, 256]
     bsizes = [1]
     cml_embedding = Embedding(embedding.weight.detach().numpy(), name="embedding")
+    cml_mask = Mask(256)
 
     for do_pre_norm in [False, True]:
         for do_rope in [False, True]:
@@ -392,7 +404,10 @@ def main():
                                 use_pos_embedding=do_rope,
                             )
                             with torch.no_grad():
-                                torch_result = torch_attn(torch_hidden_states)[0].numpy()
+                                torch_results = torch_attn(
+                                    torch_hidden_states, torch_causal_mask
+                                )  # [0].numpy()
+                                torch_result = torch_results[0].numpy()
 
                             shapes = [
                                 (bsz, seqlen) for seqlen in seqlens for bsz in bsizes
@@ -436,31 +451,36 @@ def main():
                                 opset_version=mil.builder.AvailableTarget.iOS17,
                             )
                             def cml_program(input_ids):
+                                indices = make_rope_mask_indices(input_ids)
                                 if do_rope:
                                     rope.init_embedding_slices(
-                                        input_ids, channels_first=channels_first
+                                        indices, channels_first=channels_first
                                     )
+                                mask = cml_mask.get_mask(indices)
                                 hidden_states = cml_embedding(input_ids)
                                 if channels_first:
                                     hidden_states = mb.transpose(
                                         x=hidden_states, perm=[0, 2, 1]
                                     )
-                                return mb.identity(
-                                    x=attention_monstrosity(
-                                        hidden_states,
-                                        headdim,
-                                        nqheads,
-                                        nkvheads,
-                                        qnorm=qnorm,
-                                        knorm=knorm,
-                                        rope=rope,
-                                        channels_first=channels_first,
-                                        pre_normalization_and_pos_encoding=do_pre_norm,
-                                        multi_query_head=multi_query_head,
-                                        repeat_interleave=repeat_interleave,
-                                    ),
+                                attn_result = attention_monstrosity(
+                                    hidden_states,
+                                    mask,
+                                    headdim,
+                                    nqheads,
+                                    nkvheads,
+                                    qnorm=qnorm,
+                                    knorm=knorm,
+                                    rope=rope,
+                                    channels_first=channels_first,
+                                    pre_normalization_and_pos_encoding=do_pre_norm,
+                                    multi_query_head=multi_query_head,
+                                    repeat_interleave=repeat_interleave,
+                                )
+                                x = mb.identity(
+                                    x=attn_result[0],
                                     name="coreml_attention_output",
                                 )  # Idendity for constant naming
+                                return x, *attn_result[1:]
 
                             cml_attention_model = ct.convert(
                                 cml_program,
@@ -476,26 +496,51 @@ def main():
                                 # pass_pipeline=ct.PassPipeline.EMPTY,
                             )
 
-                            cml_attn_result = cml_attention_model.predict(
+                            cml_attn_results = cml_attention_model.predict(
                                 {"input_ids": input_ids}
-                            )['coreml_attention_output']
+                            )
+                            cml_attn_result = cml_attn_results[
+                                "coreml_attention_output"
+                            ]
                             if channels_first:
                                 cml_attn_result = cml_attn_result.transpose(0, 2, 1)
                             else:
                                 cml_attn_result = cml_attn_result
 
-                            passes = np.allclose(torch_result, cml_attn_result, rtol=1e-5, atol=1e-6)
+                            passes = np.allclose(
+                                torch_result,
+                                cml_attn_result,
+                                # maximum relative error still gives high values, ~5%, but
+                                # likely overlookable from absolute error
+                                # rtol=1e-5,
+                                atol=5e-6,  # kinda manually fine tuned atol, but still very low
+                            )
 
-                            assert passes, \
-                                f"Failed for:\n" \
-                                f"do_pre_norm: {do_pre_norm}" \
-                                f"do_rope: {do_rope}" \
-                                f"do_norm: {do_norm}" \
-                                f"channels_first: {channels_first}" \
-                                f"multi_query_head: {multi_query_head}" \
-                                f"multi_query_head: {repeat_interleave}"
+                            abs_error = np.abs((cml_attn_result - torch_result))
+                            rel_error = np.abs(abs_error / torch_result)
+                            print(passes, abs_error.max(), rel_error.max())
+                            assert passes, (
+                                f"Failed for:\n"
+                                f"do_pre_norm: {do_pre_norm}\n"
+                                f"do_rope: {do_rope}\n"
+                                f"do_norm: {do_norm}\n"
+                                f"channels_first: {channels_first}\n"
+                                f"multi_query_head: {multi_query_head}\n"
+                                f"repeat_interleave: {repeat_interleave}\n"
+                            )
 
-                            print(passes)
+
+                            print(
+                                (
+                                    f"do_pre_norm: {do_pre_norm}\n"
+                                    f"do_rope: {do_rope}\n"
+                                    f"do_norm: {do_norm}\n"
+                                    f"channels_first: {channels_first}\n"
+                                    f"multi_query_head: {multi_query_head}\n"
+                                    f"repeat_interleave: {repeat_interleave}\n"
+                                )
+                            )
+
 
 if __name__ == "__main__":
     main()

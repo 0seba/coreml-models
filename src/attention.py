@@ -9,6 +9,12 @@ from utils import is_symbolic
 from layers import Linear, RMSNorm
 
 
+def make_rope_mask_indices(input_ids):
+    ones = mb.fill_like(ref_tensor=input_ids, value=np.array(1, dtype=np.int32))
+    indices = mb.cumsum(x=ones, axis=1, exclusive=True)
+    return indices
+
+
 def rope_rotate(
     x,
     pos_sin_1,
@@ -173,7 +179,8 @@ class RoPEEmbedding:
     def init_embedding_slices(
         self,
         # query_length: Var, key_length: Var,
-        input_ids,
+        # input_ids,
+        indices,
         channels_first=True,
     ):
         cos_emb, sin_emb, M = self.compute_rope_embedding(
@@ -183,19 +190,19 @@ class RoPEEmbedding:
             self.dtype,
         )
 
-        if not is_symbolic(input_ids.shape):
+        if not is_symbolic(indices.shape):
             if self.implementation == "split_concat":
                 _cos_emb = np.expand_dims(cos_emb.T, 0)  # (1, 64, length)
                 _sin_emb = np.expand_dims(sin_emb.T, 0)
 
-                self.query_cos_emb = _cos_emb[:, :, : input_ids.shape[1]]
-                self.query_sin_emb = _sin_emb[:, :, : input_ids.shape[1]]
-                self.key_cos_emb = _cos_emb[:, :, : input_ids.shape[1]]
-                self.key_sin_emb = _sin_emb[:, :, : input_ids.shape[1]]
+                self.query_cos_emb = _cos_emb[:, :, : indices.shape[1]]
+                self.query_sin_emb = _sin_emb[:, :, : indices.shape[1]]
+                self.key_cos_emb = _cos_emb[:, :, : indices.shape[1]]
+                self.key_sin_emb = _sin_emb[:, :, : indices.shape[1]]
             return
 
-        ones = mb.fill_like(ref_tensor=input_ids, value=np.array(1, dtype=np.int32))
-        indices = mb.cumsum(x=ones, axis=1, exclusive=True)
+        # ones = mb.fill_like(ref_tensor=input_ids, value=np.array(1, dtype=np.int32))
+        # indices = mb.cumsum(x=ones, axis=1, exclusive=True)
         # qindices = mb.sub(x=np.array(2048, dtype=np.int32), y=indices)
         qindices = indices
         if self.implementation == "split_concat":
@@ -209,16 +216,32 @@ class RoPEEmbedding:
                 axis = 1
 
             self.query_cos_emb = mb.gather(
-                x=_cos_emb, indices=qindices, axis=axis, batch_dims=1
+                x=_cos_emb,
+                indices=qindices,
+                axis=axis,
+                batch_dims=1,
+                name="rope_query_cos_emb",
             )
             self.query_sin_emb = mb.gather(
-                x=_sin_emb, indices=qindices, axis=axis, batch_dims=1
+                x=_sin_emb,
+                indices=qindices,
+                axis=axis,
+                batch_dims=1,
+                name="rope_query_sin_emb",
             )
             self.key_cos_emb = mb.gather(
-                x=_cos_emb, indices=indices, axis=axis, batch_dims=1
+                x=_cos_emb,
+                indices=indices,
+                axis=axis,
+                batch_dims=1,
+                name="rope_key_sin_emb",
             )
             self.key_sin_emb = mb.gather(
-                x=_sin_emb, indices=indices, axis=axis, batch_dims=1
+                x=_sin_emb,
+                indices=indices,
+                axis=axis,
+                batch_dims=1,
+                name="rope_key_sin_emb",
             )
 
         elif self.implementation == "split_mul":
@@ -379,6 +402,31 @@ class RoPEEmbedding:
         xrot = RoPEEmbedding.rotate_half(x, prefix, axis)
         rhs = mb.mul(x=xrot, y=pos_sin, name=f"{prefix}_rope_rhs_mult")
         return mb.add(x=lhs, y=rhs, name=f"{prefix}_rope")
+
+
+class Mask:
+    def __init__(self, max_length, dtype=np.float32):
+        self.causal_mask = np.expand_dims(
+            np.triu(np.full((max_length, max_length), -np.inf, dtype=dtype), 1),
+            axis=0,
+        )
+
+    def get_mask(self, indices):
+        if is_symbolic(indices.shape):
+            mask = mb.gather(
+                x=self.causal_mask,
+                indices=indices,
+                axis=2,
+                batch_dims=1,
+                name="mask_gather_0",
+            )
+            mask = mb.gather(
+                x=mask, indices=indices, axis=1, batch_dims=1, name="mask_gather_1"
+            )
+            return mask
+        else:
+            seqlen = indices.shape[1]
+            return self.causal_mask[:, :seqlen, :seqlen]
 
 
 def attention(
@@ -567,6 +615,7 @@ def attention(
 
 def attention_monstrosity(
     qkv,
+    mask,
     headdim,
     nqheads,
     nkvheads,
@@ -707,6 +756,12 @@ def attention_monstrosity(
                 y=hscale,
                 name=f"attention_{block_index}_scaled_scores",
             )
+            if mask is not None:
+                scores = mb.add(
+                    x=scores,
+                    y=mask,
+                    name=f"attention_{block_index}_masked_scaled_scores",
+                )
             weights = mb.softmax(
                 x=scores,
                 name=f"attention_{block_index}_softmax",
@@ -746,7 +801,7 @@ def attention_monstrosity(
                 shape=newshape,
                 name=f"attention_{block_index}_shape_restored",
             )
-            return attention
+            return attention, qheads, kheads
 
         elif multi_query_head:
             qheads = mb.split(
@@ -861,7 +916,7 @@ def attention_monstrosity(
             scores = mb.mul(
                 x=scores,
                 y=hscale,
-                name=f"attention_{block_index}.scores_head_{q_head_num}",
+                name=f"attention_{block_index}_scaled_scores_head_{q_head_num}",
             )
             # if mask is None:
             #     pass
@@ -872,11 +927,12 @@ def attention_monstrosity(
             # mask = mb.sub(x=mask, y=indices)
             # mask = mb.mul(x=mask, y=np.array(-np.inf, dtype=np.float16))
             # return scores
-            # scores = mb.add(
-            #     x=scores,
-            #     y=mask,
-            #     name=f"attention_{block_index}_masked_scores_head_{q_head_num}",
-            # )
+            if mask is not None:
+                scores = mb.add(
+                    x=scores,
+                    y=mask,
+                    name=f"attention_{block_index}_masked_scaled_scores_head_{q_head_num}",
+                )
             weights = mb.softmax(
                 x=scores,
                 name=f"attention_{block_index}_softmax_head_{q_head_num}",
@@ -923,4 +979,4 @@ def attention_monstrosity(
                 x=attention, axes=[1], name=f"attention_{block_index}_squeezed"
             )
 
-    return attention
+    return attention, 
