@@ -35,6 +35,7 @@ class WbGeneric(NamedCall):
         assert self.op, NotImplementedError("Undefined operation op")
         if self.b is not None:
             return self.op(x=x, weight=self.w, bias=self.b, name=self.name(name))
+
         return self.op(x=x, weight=self.w, name=self.name(name))
 
 
@@ -129,7 +130,7 @@ class RMSNorm(NamedCall):
         if axes is None:
             axes = self.axes
         shape = x.shape
-        dims = [shape[i] for i in axes] # x.shape[*axes] does not work
+        dims = [shape[i] for i in axes]  # x.shape[*axes] does not work
         dimroot = np.sqrt(np.prod(dims))
         if types.builtin_to_string(x.dtype) == "fp16":
             xnormed = RMSNorm.stable_low_precision_normalize(
@@ -181,6 +182,7 @@ class FFN:
         x = self.wout(x, name=f"{prefix}_ffn_outproj")
         return x
 
+
 class Head:
     ## TODO: using 64 padded vocab w is slightly faster 5%, have to find how to
     # fill result of output matmul with padded values with -inf and if that is faster
@@ -190,12 +192,12 @@ class Head:
         w: np.ndarray,
         split_size,
         channels_first: bool,
-        topk=0, # Seems that topk is not supported by ANE
+        topk=0,  # Seems that topk is not supported by ANE
         return_logits=True,
         cast=True,
         prefix=None,
     ):
-        self.w = w # has same shape as input embeddings, (vocab_size, hidden dim)
+        self.w = w  # has same shape as input embeddings, (vocab_size, hidden dim)
         self.channels_first = channels_first
         self.nsplits = math.ceil(w.shape[0] / split_size)
         self.topk = topk
@@ -214,13 +216,13 @@ class Head:
             prefix = self.prefix
         if channels_first is None:
             channels_first = self.channels_first
-            axis = 2
-        else:
-            axis = 1
+
+        axis = 1 if channels_first else 2
+
         ws = mb.split(
             x=self.w,
             split_sizes=self.split_sizes,
-            axis=axis,
+            axis=0,
             name="head_wsplits",
         )
 
@@ -242,7 +244,7 @@ class Head:
                 w = mb.transpose(x=w, perm=[1, 0], name=f"prediction_head_{i}")
                 # transpose_y parameter does not work with big weights
                 # I think this could also be a linear
-                logits_i = mb.matmul(x=x, y=w, transpose_y=False, name=f"logits_{i}") 
+                logits_i = mb.matmul(x=x, y=w, transpose_y=False, name=f"logits_{i}")
             logits.append(logits_i)
 
             if self.topk > 0:
@@ -257,10 +259,13 @@ class Head:
             logits = mb.concat(
                 values=[logits[i] for i in range(len(self.split_sizes))],
                 axis=axis,
-                name="logits",
+                name="_logits",
             )
             if self.cast and types.builtin_to_string(x.dtype) == "fp16":
-                logits = mb.cast(x=logits, dtype="fp32", name=f"logits_cast")
+                logits = mb.cast(x=logits, dtype="fp32", name=f"logits")
+            else:
+                # just for name consistency
+                logits = mb.identity(x=logits, name="logits")
 
             output += (logits,)
 

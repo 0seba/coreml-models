@@ -49,11 +49,13 @@ class RoPEEmbedding:
         hdim,
         qlen,
         klen,
+        channels_first,
         freq_constant=10_000,
         dtype=np.float32,
         implementation="split_concat",
     ):
         self.hdim = hdim
+        self.channels_first = channels_first
         self.freq_constant = freq_constant
         self.dtype = dtype
         self.length = max(qlen, klen)
@@ -181,8 +183,10 @@ class RoPEEmbedding:
         # query_length: Var, key_length: Var,
         # input_ids,
         indices,
-        channels_first=True,
+        channels_first=None,
     ):
+        if channels_first is None:
+            channels_first = self.channels_first
         cos_emb, sin_emb, M = self.compute_rope_embedding(
             self.hdim,
             self.freq_constant,
@@ -979,4 +983,4 @@ def attention_monstrosity(
                 x=attention, axes=[1], name=f"attention_{block_index}_squeezed"
             )
 
-    return attention, 
+    return (attention,)
