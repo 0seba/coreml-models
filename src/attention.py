@@ -238,7 +238,7 @@ class RoPEEmbedding:
                 indices=indices,
                 axis=axis,
                 batch_dims=1,
-                name="rope_key_sin_emb",
+                name="rope_key_cos_emb",
             )
             self.key_sin_emb = mb.gather(
                 x=_sin_emb,
@@ -674,7 +674,7 @@ def attention_monstrosity(
     else:
         hscale = np.float32(headdim**-0.5)
 
-    if pre_normalization_and_pos_encoding or repeat_interleave:
+    if repeat_interleave:
         # newshape = np.array([0, nqheads, hdim, -1])
         # TEMP batch size 1, I think it should be possible to have flexible batch size and sequence length
         # by customizing the operation definition
@@ -737,6 +737,12 @@ def attention_monstrosity(
             vheads = mb.concat(
                 values=vheads, axis=1, name=f"attention_{block_index}_v_interleave"
             )
+
+            # attention = mb.scaled_dot_product_attention(
+            #     query=qheads,
+            #     key=kheads,
+            #     value=vheads,
+            # )
 
             # QKV: (batch size, heads, hdim, length) when channels first
             if channels_first:
@@ -806,8 +812,58 @@ def attention_monstrosity(
                 name=f"attention_{block_index}_shape_restored",
             )
             return attention, qheads, kheads
+    elif pre_normalization_and_pos_encoding:
+        if multi_query_head:
+            if channels_first:
+                newshape = np.array([1, nqheads + nkvheads * 2, headdim, -1])
+                qkv = mb.reshape(
+                    x=qkv,
+                    shape=newshape,
+                    name=f"attention_{block_index}_all_reshaped_heads",
+                )
+            else:
+                # newshape = np.array([1, nqheads + nkvheads * 2, -1, hdim])
+                qkv = mb.reshape(
+                    x=qkv,
+                    shape=[1, -1, nqheads + nkvheads * 2, headdim],
+                    name=f"attention_{block_index}_all_reshaped_heads",
+                )
+                qkv = mb.transpose(
+                    x=qkv,
+                    perm=[0, 2, 1, 3],
+                    name=f"attention_{block_index}_all_reshaped_heads_T",
+                )
 
-        elif multi_query_head:
+            qheads, kheads, vheads = mb.split(
+                x=qkv,
+                split_sizes=[nqheads, nkvheads, nkvheads],
+                axis=1,
+                name=f"attention_{block_index}_split_reshaped_heads",
+            )
+            if qnorm:
+                qheads = qnorm(
+                    qheads, prefix=f"attention_{block_index}_q", axes=[axis + 1]
+                )
+            if knorm:
+                kheads = knorm(
+                    kheads, prefix=f"attention_{block_index}_k", axes=[axis + 1]
+                )
+
+            if rope and rope.implementation == "split_concat":
+                qheads = rope.apply_rotary_pos_emb(
+                    x=qheads,
+                    pos_sin=rope.query_sin_emb,
+                    pos_cos=rope.query_cos_emb,
+                    prefix=f"attention_{block_index}_q",
+                    axis=axis + 1,
+                )
+                kheads = rope.apply_rotary_pos_emb(
+                    x=kheads,
+                    pos_sin=rope.key_sin_emb,
+                    pos_cos=rope.key_cos_emb,
+                    prefix=f"attention_{block_index}_k",
+                    axis=axis + 1,
+                )
             qheads = mb.split(
                 x=qheads,
                 num_splits=nkvheads,
@@ -816,27 +872,121 @@ def attention_monstrosity(
             )
             qiter = 1
 
+            kheads = mb.split(
+                x=kheads,
+                num_splits=nkvheads,
+                axis=1,
+                name=f"attention_{block_index}_k_head_split",
+            )
+            vheads = mb.split(
+                x=vheads,
+                num_splits=nkvheads,
+                axis=1,
+                name=f"attention_{block_index}_v_head_split",
+            )
+
         else:
+            qkheads, vheads = mb.split(
+                x=qkv,
+                axis=axis,
+                split_sizes=[
+                    nqheads * headdim + nkvheads * headdim,
+                    nkvheads * headdim,
+                ],
+                name=f"attention_{block_index}_qk_v_split",
+            )
+
+            vheads = mb.split(
+                x=vheads,
+                split_sizes=[headdim] * nkvheads,
+                axis=axis,
+                name=f"attention_{block_index}_v_split_heads",
+            )
+
+            if channels_first:
+                newshape = np.array([1, nqheads + nkvheads, headdim, -1])
+                qkheads = mb.reshape(
+                    x=qkheads,
+                    shape=newshape,
+                    name=f"attention_{block_index}_qk_reshaped_heads",
+                )
+            else:
+                # newshape = np.array([1, nqheads + nkvheads * 2, -1, hdim])
+                qkheads = mb.reshape(
+                    x=qkheads,
+                    shape=[1, -1, nqheads + nkvheads, headdim],
+                    name=f"attention_{block_index}_qk_reshaped_heads",
+                )
+                qkheads = mb.transpose(
+                    x=qkheads,
+                    perm=[0, 2, 1, 3],
+                    name=f"attention_{block_index}_qk_reshaped_heads_T",
+                )
+
+            qheads, kheads = mb.split(
+                x=qkheads,
+                split_sizes=[nqheads, nkvheads],
+                axis=1,
+                name=f"attention_{block_index}_q_k_heads",
+            )
+
+            if qnorm:
+                qheads = qnorm(
+                    qheads, prefix=f"attention_{block_index}_q", axes=[axis + 1]
+                )
+            if knorm:
+                kheads = knorm(
+                    kheads, prefix=f"attention_{block_index}_k", axes=[axis + 1]
+                )
+
+            if rope and rope.implementation == "split_concat":
+                qheads = rope.apply_rotary_pos_emb(
+                    x=qheads,
+                    pos_sin=rope.query_sin_emb,
+                    pos_cos=rope.query_cos_emb,
+                    prefix=f"attention_{block_index}_q",
+                    axis=axis + 1,
+                )
+                kheads = rope.apply_rotary_pos_emb(
+                    x=kheads,
+                    pos_sin=rope.key_sin_emb,
+                    pos_cos=rope.key_cos_emb,
+                    prefix=f"attention_{block_index}_k",
+                    axis=axis + 1,
+                )
+
+            if channels_first:
+                qheads = mb.reshape(
+                    x=qheads,
+                    shape=[1, nqheads * headdim, -1],
+                )
+                kheads = mb.reshape(
+                    x=kheads,
+                    shape=[1, nkvheads * headdim, -1],
+                )
+            else:
+                qheads = mb.reshape(
+                    x=qheads,
+                    shape=[1, -1, nqheads * headdim],
+                )
+                kheads = mb.reshape(
+                    x=kheads,
+                    shape=[1, -1, nkvheads * headdim],
+                )
+
             qheads = mb.split(
                 x=qheads,
                 num_splits=nqheads,
                 axis=1,
                 name=f"attention_{block_index}_q_head_split",
             )
+            kheads = mb.split(
+                x=kheads,
+                num_splits=nkvheads,
+                axis=1,
+                name=f"attention_{block_index}_k_head_split",
+            )
             qiter = num_groups
-
-        kheads = mb.split(
-            x=kheads,
-            num_splits=nkvheads,
-            axis=1,
-            name=f"attention_{block_index}_k_head_split",
-        )
-        vheads = mb.split(
-            x=vheads,
-            num_splits=nkvheads,
-            axis=1,
-            name=f"attention_{block_index}_v_head_split",
-        )
     else:
         if multi_query_head:
             head_splits = mb.split(
@@ -864,6 +1014,8 @@ def attention_monstrosity(
     attns = []
     for i in range(nkvheads):
         kh = kheads[i]
+        # if pre_normalization_and_pos_encoding and not multi_query_head:
+        #     kh = mb.gather(x=kheads, axis=1, indices=[i], batch_dims=1)
         if not pre_normalization_and_pos_encoding:
             axis = 1 if channels_first else 2
             if knorm:
@@ -876,16 +1028,21 @@ def attention_monstrosity(
                     prefix=f"attention_{block_index}_k_{i}",
                     axis=axis,
                 )
+        # else:
+        #     kh = kheads[i]
+
         vh = vheads[i]
+        # if pre_normalization_and_pos_encoding and not multi_query_head:
+        #     vh = mb.squeeze(x=vh, axes=[1])
         for j in range(qiter):
             if multi_query_head:
                 q_head_num = i
             else:
                 q_head_num = i * num_groups + j
 
-            # return qheads
             qh = qheads[q_head_num]
-
+            # if pre_normalization_and_pos_encoding and not multi_query_head:
+            #     qh = mb.gather(x=qheads, axis=1, indices=[q_head_num], batch_dims=1)
             if not pre_normalization_and_pos_encoding:
                 if channels_first and multi_query_head:  # (batch, head, hdim, len)
                     axis = 2
@@ -909,6 +1066,8 @@ def attention_monstrosity(
                         prefix=f"attention_{block_index}_q_{q_head_num}",
                         axis=axis,
                     )
+            # else:
+            #     qh = qheads[q_head_num]
 
             scores = mb.matmul(
                 x=qh,
@@ -972,15 +1131,15 @@ def attention_monstrosity(
             axis = 1
         else:
             axis = 2
-        axis += 1 if pre_normalization_and_pos_encoding else 0
+        # axis += 1 if pre_normalization_and_pos_encoding else 0
         attention = mb.concat(
             values=attns,
             axis=axis,
             name=f"attention_{block_index}",
         )
-        if pre_normalization_and_pos_encoding:
-            attention = mb.squeeze(
-                x=attention, axes=[1], name=f"attention_{block_index}_squeezed"
-            )
+        # if pre_normalization_and_pos_encoding:
+        #     attention = mb.squeeze(
+        #         x=attention, axes=[1], name=f"attention_{block_index}_squeezed"
+        #     )
 
     return (attention,)

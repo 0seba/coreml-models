@@ -9,8 +9,9 @@ from coremltools.converters.mil.mil import Operation, Var, types
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
 from coremltools.converters.mil.mil.ops.defs.iOS17 import _IOS17_TARGET
 
-# from custom_conv import conv
-# register_op(conv, opset_version=_IOS17_TARGET, allow_override=True)
+from custom_conv import conv
+
+register_op(conv, opset_version=_IOS17_TARGET, allow_override=True)  #
 
 
 class NamedCall:
@@ -55,10 +56,12 @@ class Embedding(NamedCall):
 
     def __call__(self, x, name=None):
         return mb.gather(
+            # x=np.expand_dims(self.w.T, 0),
             x=self.w,
             indices=x,
             axis=0,
             name=self.name(name),
+            # batch_dims=1,
             # validate_indices=self.validate_indices,
         )
 
