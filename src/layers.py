@@ -8,9 +8,7 @@ from coremltools.converters.mil.mil import Operation, Var, types
 
 from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
 from coremltools.converters.mil.mil.ops.defs.iOS17 import _IOS17_TARGET
-
 from custom_conv import conv
-
 register_op(conv, opset_version=_IOS17_TARGET, allow_override=True)  #
 
 
@@ -129,7 +127,7 @@ class RMSNorm(NamedCall):
         )
         return mb.mul(x=x, y=rmsnorm_reciprocal, name=f"{prefix}_rmsnorm_normalized")
 
-    def __call__(self, x, prefix=None, w=None, axes=None):
+    def __call__(self, x, prefix=None, w=None, axes=None, squeeze=False):
         if axes is None:
             axes = self.axes
         shape = x.shape
@@ -144,6 +142,8 @@ class RMSNorm(NamedCall):
 
         w = self.w if w is None else w
         if w is not None:
+            if squeeze: # Quick fix
+                w = w.squeeze()
             return mb.mul(x=xnormed, y=w, name=f"{prefix}_rmsnorm")
         return xnormed
 

@@ -184,6 +184,9 @@ class RoPEEmbedding:
         # input_ids,
         indices,
         channels_first=None,
+        # query_pos=None,
+        # cached=False,
+        cache_length=0,
     ):
         if channels_first is None:
             channels_first = self.channels_first
@@ -193,31 +196,73 @@ class RoPEEmbedding:
             self.length,
             self.dtype,
         )
+        if channels_first:
+            _cos_emb = np.expand_dims(cos_emb.T, 0)
+            _sin_emb = np.expand_dims(sin_emb.T, 0)
+            axis = 2
+        else:
+            _cos_emb = np.expand_dims(cos_emb, 0)
+            _sin_emb = np.expand_dims(sin_emb, 0)
+            axis = 1
+
+        qindices = indices
+
+        if cache_length:
+            self.query_cos_emb = mb.gather(
+                x=_cos_emb,
+                indices=qindices,
+                axis=axis,
+                # batch_dims=1,
+                name="rope_query_cos_emb",
+            )
+            self.query_sin_emb = mb.gather(
+                x=_sin_emb,
+                indices=qindices,
+                axis=axis,
+                # batch_dims=1,
+                name="rope_query_sin_emb",
+            )
+            if channels_first:
+                self.key_cos_emb = _cos_emb[:, :, :cache_length]
+                self.key_sin_emb = _sin_emb[:, :, :cache_length]
+            else:
+                self.key_cos_emb = _cos_emb[:, :cache_length, :]
+                self.key_sin_emb = _sin_emb[:, :cache_length, :]
+
+            return
 
         if not is_symbolic(indices.shape):
             if self.implementation == "split_concat":
-                _cos_emb = np.expand_dims(cos_emb.T, 0)  # (1, 64, length)
-                _sin_emb = np.expand_dims(sin_emb.T, 0)
+                if channels_first:
+                    # _cos_emb = np.expand_dims(cos_emb.T, 0)  # (1, 64, length)
+                    # _sin_emb = np.expand_dims(sin_emb.T, 0)
 
-                self.query_cos_emb = _cos_emb[:, :, : indices.shape[1]]
-                self.query_sin_emb = _sin_emb[:, :, : indices.shape[1]]
-                self.key_cos_emb = _cos_emb[:, :, : indices.shape[1]]
-                self.key_sin_emb = _sin_emb[:, :, : indices.shape[1]]
+                    self.query_cos_emb = _cos_emb[:, :, : indices.shape[1]]
+                    self.query_sin_emb = _sin_emb[:, :, : indices.shape[1]]
+                    self.key_cos_emb = _cos_emb[:, :, : indices.shape[1]]
+                    self.key_sin_emb = _sin_emb[:, :, : indices.shape[1]]
+                else:
+                    # _cos_emb = np.expand_dims(cos_emb, 0)  # (1, 64, length)
+                    # _sin_emb = np.expand_dims(sin_emb, 0)
+
+                    self.query_cos_emb = _cos_emb[:, : indices.shape[1], :]
+                    self.query_sin_emb = _sin_emb[:, : indices.shape[1], :]
+                    self.key_cos_emb = _cos_emb[:, : indices.shape[1], :]
+                    self.key_sin_emb = _sin_emb[:, : indices.shape[1], :]
             return
 
         # ones = mb.fill_like(ref_tensor=input_ids, value=np.array(1, dtype=np.int32))
         # indices = mb.cumsum(x=ones, axis=1, exclusive=True)
         # qindices = mb.sub(x=np.array(2048, dtype=np.int32), y=indices)
-        qindices = indices
         if self.implementation == "split_concat":
-            if channels_first:
-                _cos_emb = np.expand_dims(cos_emb.T, 0)
-                _sin_emb = np.expand_dims(sin_emb.T, 0)
-                axis = 2
-            else:
-                _cos_emb = np.expand_dims(cos_emb, 0)
-                _sin_emb = np.expand_dims(sin_emb, 0)
-                axis = 1
+            # if channels_first:
+            #     _cos_emb = np.expand_dims(cos_emb.T, 0)
+            #     _sin_emb = np.expand_dims(sin_emb.T, 0)
+            #     axis = 2
+            # else:
+            #     _cos_emb = np.expand_dims(cos_emb, 0)
+            #     _sin_emb = np.expand_dims(sin_emb, 0)
+            #     axis = 1
 
             self.query_cos_emb = mb.gather(
                 x=_cos_emb,
@@ -398,7 +443,9 @@ class RoPEEmbedding:
             x=x, num_splits=2, axis=axis, name=f"{prefix}_rotate_half_split"
         )
         neg_x2 = mb.mul(x=x2, y=mone, name=f"{prefix}_rotate_half_neg")
-        return mb.concat(values=(neg_x2, x1), axis=axis)
+        return mb.concat(
+            values=(neg_x2, x1), axis=axis, name=f"{prefix}_rotate_half_concat"
+        )
 
     @staticmethod
     def apply_rotary_pos_emb(x, pos_sin, pos_cos, prefix=None, axis=-1):
@@ -415,18 +462,19 @@ class Mask:
             axis=0,
         )
 
-    def get_mask(self, indices):
-        if is_symbolic(indices.shape):
+    def get_mask(self, indices, static=True):
+        if not static or is_symbolic(indices.shape):
             mask = mb.gather(
                 x=self.causal_mask,
                 indices=indices,
-                axis=2,
-                batch_dims=1,
+                axis=1,
+                batch_dims=1 if static else 0,
                 name="mask_gather_0",
             )
-            mask = mb.gather(
-                x=mask, indices=indices, axis=1, batch_dims=1, name="mask_gather_1"
-            )
+            if is_symbolic(indices.shape):
+                mask = mb.gather(
+                    x=mask, indices=indices, axis=2, batch_dims=1, name="mask_gather_1"
+                )
             return mask
         else:
             seqlen = indices.shape[1]
@@ -631,39 +679,9 @@ def attention_monstrosity(
     multi_query_head,
     repeat_interleave,
     block_index=0,
+    key_cache=None,
+    value_cache=None,
 ):
-    # ones = mb.fill_like(
-    #     ref_tensor=input_ids,
-    #     value=np.array(1, dtype=np.int32))
-    # indices = mb.cumsum(x=ones, axis=1, exclusive=True)
-    # qindices = mb.sub(x=np.array(2048, dtype=np.int32), y=indices)
-    # if rope_impl == "split_concat": # or rope_impl == "split_mul":
-    #     if channels_first:
-    #         _cos_emb = cos_emb.T
-    #         _sin_emb = sin_emb.T
-    #         rope_axis = 2
-    #     else:
-    #         _cos_emb = cos_emb
-    #         _sin_emb = sin_emb
-    #         rope_axis = 1
-    #     _cos_emb = np.expand_dims(_cos_emb, 0)
-    #     _sin_emb = np.expand_dims(_sin_emb, 0)
-    #     query_cos_emb = mb.gather(x=_cos_emb, indices=qindices, axis=rope_axis, batch_dims=1)
-    #     query_sin_emb = mb.gather(x=_sin_emb, indices=qindices, axis=rope_axis, batch_dims=1)
-    #     key_cos_emb = mb.gather(x=_cos_emb, indices=indices, axis=rope_axis, batch_dims=1)
-    #     key_sin_emb = mb.gather(x=_sin_emb, indices=indices, axis=rope_axis, batch_dims=1)
-
-    # these are super slow
-    # indices = mb.cast(x=ones, dtype='int16')
-    # mask = mb.gather(x=causal_mask, indices=indices, axis=2, batch_dims=1)
-    # mask = mb.gather(x=mask, indices=indices, axis=2, batch_dims=1)
-    # ones = mb.expand_dims(x=ones, axes=[-1])
-    # tshape = mb.shape(x=ones)
-    # ones = mb.transpose(x=ones, perm=[0, 2, 1])
-    # ones = mb.tile(x=ones, reps=tshape)
-    # indices = mb.expand_dims(x=indices, axes=[1])
-    # indices = mb.sub(x=indices, y=mb.transpose(x=indices, perm=[0, 2, 1]))=
-
     num_groups = nqheads // nkvheads
     if channels_first:
         axis = 1
@@ -746,54 +764,67 @@ def attention_monstrosity(
 
             # QKV: (batch size, heads, hdim, length) when channels first
             if channels_first:
-                scores = mb.matmul(
-                    x=qheads,
-                    y=kheads,
-                    transpose_x=True,
-                    name=f"attention_{block_index}_scores",
+                attention = mb.scaled_dot_product_attention(
+                    query=mb.transpose(x=qheads, perm=[0, 1, 3, 2]),
+                    key=mb.transpose(x=kheads, perm=[0, 1, 3, 2]),
+                    value=mb.transpose(x=vheads, perm=[0, 1, 3, 2]),
+                    attn_mask=mask,
                 )
-                sm_axis = -1
-            else:
-                scores = mb.matmul(
-                    x=qheads,
-                    y=kheads,
-                    transpose_y=True,
-                    name=f"attention_{block_index}_scores",
-                )
-                sm_axis = -1
-            scores = mb.mul(
-                x=scores,
-                y=hscale,
-                name=f"attention_{block_index}_scaled_scores",
-            )
-            if mask is not None:
-                scores = mb.add(
-                    x=scores,
-                    y=mask,
-                    name=f"attention_{block_index}_masked_scaled_scores",
-                )
-            weights = mb.softmax(
-                x=scores,
-                name=f"attention_{block_index}_softmax",
-                axis=sm_axis,
-            )
 
-            if channels_first:
-                attention = mb.matmul(
-                    x=vheads,
-                    y=weights,
-                    transpose_x=False,
-                    transpose_y=True,
-                    name=f"attention_{block_index}_attention",
-                )
-                # attention = mb.transpose(x=attention, perm=[0, 1, 3, 2])
+                # scores = mb.matmul(
+                #     x=qheads,
+                #     y=kheads,
+                #     transpose_x=True,
+                #     name=f"attention_{block_index}_scores",
+                # )
+                # sm_axis = -1
             else:
-                attention = mb.matmul(
-                    x=weights,
-                    y=vheads,
-                    # transpose_x=True,
-                    name=f"attention_{block_index}_attention",
+                attention = mb.scaled_dot_product_attention(
+                    query=qheads,
+                    key=kheads,
+                    value=vheads,
+                    attn_mask=mask,
                 )
+            #     scores = mb.matmul(
+            #         x=qheads,
+            #         y=kheads,
+            #         transpose_y=True,
+            #         name=f"attention_{block_index}_scores",
+            #     )
+            #     sm_axis = -1
+            # scores = mb.mul(
+            #     x=scores,
+            #     y=hscale,
+            #     name=f"attention_{block_index}_scaled_scores",
+            # )
+            # if mask is not None:
+            #     scores = mb.add(
+            #         x=scores,
+            #         y=mask,
+            #         name=f"attention_{block_index}_masked_scaled_scores",
+            #     )
+            # weights = mb.softmax(
+            #     x=scores,
+            #     name=f"attention_{block_index}_softmax",
+            #     axis=sm_axis,
+            # )
+
+            # if channels_first:
+            #     attention = mb.matmul(
+            #         x=vheads,
+            #         y=weights,
+            #         transpose_x=False,
+            #         transpose_y=True,
+            #         name=f"attention_{block_index}_attention",
+            #     )
+            #     # attention = mb.transpose(x=attention, perm=[0, 1, 3, 2])
+            # else:
+            #     attention = mb.matmul(
+            #         x=weights,
+            #         y=vheads,
+            #         # transpose_x=True,
+            #         name=f"attention_{block_index}_attention",
+            #     )
 
             if channels_first:
                 newshape = np.array([1, nqheads * headdim, -1])
@@ -1143,3 +1174,215 @@ def attention_monstrosity(
         #     )
 
     return (attention,)
+
+
+def stateful_attention(
+    qkv,
+    mask,
+    query_pos,
+    split_key_state,
+    split_value_state,
+    key_state,
+    value_state,
+    headdim,
+    nqheads,
+    nkvheads,
+    update_index,
+    qnorm: RMSNorm | None = None,
+    knorm: RMSNorm | None = None,
+    query_sin_emb=None,
+    query_cos_emb=None,
+    channels_first=False,
+    block_index=0,
+    state_implementation="",
+    state_update_at="",
+    # rope: RoPEEmbedding | None = None,
+):
+    if types.builtin_to_string(qkv.dtype) == "fp16":
+        dtype = np.float16
+    else:
+        dtype = np.float32
+    hscale = np.array(headdim**-0.5, dtype=dtype)
+    num_groups = nqheads // nkvheads
+
+    if channels_first:
+        qkv = mb.reshape(
+            x=qkv,
+            shape=[1, nqheads + nkvheads * 2, 64, 1],
+            name=f"attention_{block_index}_head_reshape",
+        )
+        qkv = mb.transpose(
+            x=qkv, perm=[0, 1, 3, 2], name=f"attention_{block_index}_head_transpose"
+        )
+    else:
+        qkv = mb.reshape(
+            x=qkv,
+            shape=[1, 1, nqheads + nkvheads * 2, 64],
+            name=f"attention_{block_index}_head_reshape",
+        )
+        qkv = mb.transpose(
+            x=qkv, perm=[0, 2, 1, 3], name=f"attention_{block_index}_head_transpose"
+        )
+
+    new_qheads, new_kheads, new_vheads = mb.split(
+        x=qkv,
+        split_sizes=[nqheads, nkvheads, nkvheads],
+        axis=1,
+        name=f"attention_{block_index}_head_split",
+    )
+    if qnorm is not None:
+        new_qheads = qnorm(
+            new_qheads, axes=[3], prefix=f"attention_{block_index}_q", squeeze=True
+        )
+    if knorm is not None:
+        new_kheads = knorm(
+            new_kheads, axes=[3], prefix=f"attention_{block_index}_k", squeeze=True
+        )
+    if query_sin_emb is not None:
+        new_qheads = RoPEEmbedding.apply_rotary_pos_emb(
+            new_qheads,
+            query_sin_emb,
+            query_cos_emb,
+            prefix=f"attention_{block_index}_q",
+        )
+        new_kheads = RoPEEmbedding.apply_rotary_pos_emb(
+            new_kheads,
+            query_sin_emb,
+            query_cos_emb,
+            prefix=f"attention_{block_index}_k",
+        )
+
+    # _kheads = mb.read_state(
+    #     input=key_state,
+    # )
+    # _vheads = mb.read_state(input=value_state)
+
+    # scatter does not work on ANE
+    # _kheads = mb.scatter(
+    #     data=_kheads,
+    #     updates=new_kheads,
+    #     indices=query_pos,
+    #     axis=2,
+    #     name=f"attention_{block_index}_k_scatter",
+    # )
+    # _vheads = mb.scatter(
+    #     data=_vheads,
+    #     updates=new_vheads,
+    #     indices=query_pos,
+    #     axis=2,
+    #     name=f"attention_{block_index}_v_scatter",
+    # )
+
+    _kheads = mb.scatter(
+        data=split_key_state, updates=new_kheads, indices=query_pos, axis=2
+    )
+    _vheads = mb.scatter(
+        data=split_value_state, updates=new_vheads, indices=query_pos, axis=2
+    )
+
+    # Nor does slice_update
+    # begin = mb.repeat()
+    # _kheads = mb.slice_update(x=_kheads, update=new_kheads, begin=[0, 0, 0, 0], end=[1, 3, 1, 64], begin_mask=[True, True, False, True], end_mask=[])
+    # _vheads = mb.slice_update(x=_vheads, update=new_vheads, begin=[0, 0, 0, 0], end=[1, 3, 1, 64])
+
+    ## But neither these operations stop ANE flow, computation continues on it, worst case all
+    ## the state updates can be moved at the end of the program
+    ## scatter seemed a bit simpler to implement, slice_update would have had to repeat query_pos 4 times
+    ## and use as begin tensor, and create another adding 1 to use ase end tensor. Also would have needed to
+    ## use begin_mask and end_mask. Timewise they seem very close, 2us in favor of slice_update, with
+    ## hardcoded begin and end, without performing tile nor addition
+
+    # For some reason updating here causes conversion to crash, thus the use of _kheads, kheads, _vheads and vheads
+    # mb.coreml_update_state(state=key_states, value=kheads)
+    # mb.coreml_update_state(state=value_states, value=vheads)
+
+    # begin = np.array([0, update_index * 3, 0, 0])
+    # end = np.array([-1, (update_index + 1) * 3, 1, -1])
+    # add = np.array([0, 0, 1, 0])
+    # update_mask = [True, False, False, True]
+    # add = mb.mul(x=add, y=query_pos)
+    # begin = mb.add(x=begin, y=add)
+    # end = mb.add(x=end, y=add)
+
+    # all_kheads = mb.slice_update(
+    #     x=key_state[1],
+    #     update=new_kheads,
+    #     begin=begin,
+    #     end=end,
+    #     begin_mask=update_mask,
+    #     end_mask=update_mask,
+    # )
+    # all_vheads = mb.slice_update(
+    #     x=value_state[1],
+    #     update=new_vheads,
+    #     begin=begin,
+    #     end=end,
+    #     begin_mask=update_mask,
+    #     end_mask=update_mask,
+    # )
+
+    if num_groups > 1:
+        kheads = mb.split(
+            x=_kheads,
+            num_splits=nkvheads,
+            axis=1,
+            name=f"attention_{block_index}_k_interleave_split",
+        )
+        vheads = mb.split(
+            x=_vheads,
+            num_splits=nkvheads,
+            axis=1,
+            name=f"attention_{block_index}_v_interleave_split",
+        )
+        kheads = [_k for _k in kheads for _ in range(num_groups)]
+        vheads = [_v for _v in vheads for _ in range(num_groups)]
+        kheads = mb.concat(
+            values=kheads, axis=1, name=f"attention_{block_index}_k_interleave_concat"
+        )
+        vheads = mb.concat(
+            values=vheads, axis=1, name=f"attention_{block_index}_v_interleave_concat"
+        )
+    else:
+        kheads = _kheads
+        vheads = _vheads
+
+    attention = mb.scaled_dot_product_attention(
+        query=new_qheads,
+        key=kheads,
+        value=vheads,
+        attn_mask=mask,
+        name=f"attention_{block_index}_sdpa",
+    )
+
+
+    # mb.coreml_update_state(state=key_state[0], value=all_kheads)
+    # mb.coreml_update_state(state=value_state[0], value=all_vheads)
+
+    if channels_first:
+        attention = mb.transpose(
+            x=attention, perm=[0, 1, 3, 2], name=f"attention_{block_index}_out_tranpose"
+        )
+        attention = mb.reshape(
+            x=attention,
+            shape=[1, nqheads * headdim, 1],
+            name=f"attention_{block_index}_out_reshape",
+        )
+    else:
+        attention = mb.transpose(
+            x=attention,
+            perm=[0, 2, 1, 3],
+            name=f"attention_{block_index}_out_transpose",
+        )
+        attention = mb.reshape(
+            x=attention,
+            shape=[1, 1, nqheads * headdim],
+            name=f"attention_{block_index}_out_reshape",
+        )
+
+
+    if state_implementation == "per_block":
+        return attention , _kheads, _vheads
+    return (attention, new_kheads, new_vheads)  # , kheads, vheads
+
+
+6
