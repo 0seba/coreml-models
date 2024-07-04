@@ -1252,10 +1252,10 @@ def stateful_attention(
             prefix=f"attention_{block_index}_k",
         )
 
-    # _kheads = mb.read_state(
-    #     input=key_state,
-    # )
-    # _vheads = mb.read_state(input=value_state)
+    if state_implementation == "per_block":
+
+        split_key_state = mb.read_state(input=key_state[0])
+        split_value_state = mb.read_state(input=value_state[0])
 
     # scatter does not work on ANE
     # _kheads = mb.scatter(
@@ -1280,6 +1280,11 @@ def stateful_attention(
         data=split_value_state, updates=new_vheads, indices=query_pos, axis=2
     )
 
+    if state_update_at == "attention":
+        mb.coreml_update_state(state=key_state[0], value=_kheads)
+        mb.coreml_update_state(state=key_state[0], value=_vheads)
+
+
     # Nor does slice_update
     # begin = mb.repeat()
     # _kheads = mb.slice_update(x=_kheads, update=new_kheads, begin=[0, 0, 0, 0], end=[1, 3, 1, 64], begin_mask=[True, True, False, True], end_mask=[])
@@ -1293,8 +1298,6 @@ def stateful_attention(
     ## hardcoded begin and end, without performing tile nor addition
 
     # For some reason updating here causes conversion to crash, thus the use of _kheads, kheads, _vheads and vheads
-    # mb.coreml_update_state(state=key_states, value=kheads)
-    # mb.coreml_update_state(state=value_states, value=vheads)
 
     # begin = np.array([0, update_index * 3, 0, 0])
     # end = np.array([-1, (update_index + 1) * 3, 1, -1])

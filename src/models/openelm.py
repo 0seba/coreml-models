@@ -380,10 +380,10 @@ class OpenELM:
                         indices=[group_i + j for j in range(nkvheads)],
                     )
             elif self.state_implementation == "per_block":
-                key_state = states[2 * i]
-                value_state = states[2 * i + 1]
-                key_state_read = mb.read_state(input=key_state)
-                value_state_read = mb.read_state(input=value_state)
+                key_state = (states[2 * i],) # tuple for consistency
+                value_state = (states[2 * i + 1],)
+                # key_state_read = mb.read_state(input=key_state)
+                # value_state_read = mb.read_state(input=value_state)
 
                 # key_state_read = mb.transpose(
                 #     x=key_state_read, perm=[0, 2, 3, 1],
@@ -392,11 +392,11 @@ class OpenELM:
                 #     x=value_state_read, perm=[0, 2, 3, 1],
                 # )
 
-                key_state = (key_state, key_state_read)
-                value_state = (value_state, value_state_read)
+                # key_state = (key_state, key_state_read)
+                # value_state = (value_state, value_state_read)
 
-                split_key_state = key_state_read
-                split_value_state = value_state_read
+                split_key_state = None
+                split_value_state = None
             elif self.state_implementation == "max_num_heads":
                 if current_num_heads == 0:
                     key_state = states[2 * state_counter]
@@ -807,7 +807,7 @@ if __name__ == "__main__":
 
     state_implementation = "per_block" # "per_block", "per_group_split", "per_group_slice", "per_group_gather", "big_state_gather", "big_state_slice", "max_num_heads"
     max_num_heads = 19
-    state_update_at = "end"
+    state_update_at = "attention"
     seqlength = 512
 
     coreml_model = from_torch(
@@ -822,7 +822,7 @@ if __name__ == "__main__":
     )
 
     shift = 0
-    num_blocks = 11
+    num_blocks = -1
     coreml_model.blocks = coreml_model.blocks[shift:]  # for testing/debugging stuff
     if num_blocks == -1:
         num_blocks = len(coreml_model.blocks)
@@ -862,26 +862,26 @@ if __name__ == "__main__":
 
         state_spec = sum(
             [
-                [
-                    mb.StateTensorSpec(
-                        (1, 64, block.attn.nkvheads, seqlength),
-                        dtype=mil.input_types.types.fp16,
-                    ),
-                    mb.StateTensorSpec(
-                        (1, 64, block.attn.nkvheads, seqlength),
-                        dtype=mil.input_types.types.fp16,
-                    ),
-                ]
                 # [
                 #     mb.StateTensorSpec(
-                #         (1, block.attn.nkvheads, seqlength, 64),
+                #         (1, 64, block.attn.nkvheads, seqlength),
                 #         dtype=mil.input_types.types.fp16,
                 #     ),
                 #     mb.StateTensorSpec(
-                #         (1, block.attn.nkvheads, seqlength, 64),
+                #         (1, 64, block.attn.nkvheads, seqlength),
                 #         dtype=mil.input_types.types.fp16,
                 #     ),
                 # ]
+                [
+                    mb.StateTensorSpec(
+                        (1, block.attn.nkvheads, seqlength, 64),
+                        dtype=mil.input_types.types.fp16,
+                    ),
+                    mb.StateTensorSpec(
+                        (1, block.attn.nkvheads, seqlength, 64),
+                        dtype=mil.input_types.types.fp16,
+                    ),
+                ]
                 for block in coreml_model.blocks
             ],
             [],
@@ -1088,10 +1088,11 @@ def var_program(
             state,
         )
         cml_converted.save(name)
-    except:
+    except Exception as e:
+        print(e)
         cml_converted.save(f"F_{name}")
 
     try:
         print(cml_converted._get_mil_internal())
-    except:
-        pass
+    except Exception as e:
+        print(e)
