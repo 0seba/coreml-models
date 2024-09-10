@@ -49,6 +49,7 @@ def qweight_to_lut(weights, scales, biases, nbits, as_uint4=True):
     weights = unpack_int32_to_intk(weights, nbits, as_uint4)
     return weights, lut
 
+
 class OtherRMSNorm:
     def __init__(self, w, name):
         self.w = w
@@ -59,8 +60,11 @@ class OtherRMSNorm:
         x = mb.expand_dims(x=x, axes=[-1, -2], name=f"{self.name}_expand")
         x = mb.l2_norm(x=x, name=f"{self.name}_l2_normalize")
         x = mb.squeeze(x=x, axes=[-1, -2], name=f"{self.name}_squeeze")
-        x = mb.mul(x=x, y=(self.w * sqrtn).astype(np.float16), name=f"{self.name}_scale")
+        x = mb.mul(
+            x=x, y=(self.w * sqrtn).astype(np.float16), name=f"{self.name}_scale"
+        )
         return x
+
 
 class Attention:
     def __init__(
@@ -229,6 +233,7 @@ class Model:
         finalnorm: RMSNorm,
         rope: RoPEEmbedding,
         mask: Mask,
+        headdim: int,
         channels_first=True,
         apply_initial_embedding=True,
         apply_lm_head=True,
@@ -246,6 +251,7 @@ class Model:
         # self.state_update_at = state_update_at
         self.apply_initial_embedding = apply_initial_embedding
         self.apply_lm_head = apply_lm_head
+        self.headdim = headdim
 
     def __call__(
         self,
@@ -278,28 +284,43 @@ class Model:
             channels_first = self.channels_first
         if channels_first:
             axis = 1
+            qseqlen = input_ids.shape[-1]
         else:
             axis = 2
+            qseqlen = input_ids.shape[1]
 
+        if len(query_pos) > 1:
+            many_query_pos = mb.concat(values=query_pos, axis=0)
+        else:
+            many_query_pos = query_pos[0]
         if mask is None:
-            mask = self.mask.get_mask(query_pos, static=False)
+            indices = np.arange(qseqlen, dtype=np.int32).reshape(
+                many_query_pos.shape[0], 1, qseqlen
+            )
+            many_query_pos = mb.expand_dims(x=many_query_pos, axes=[-1, -2])
+            indices = mb.add(x=indices, y=many_query_pos)
+            mask = self.mask.get_mask(None, static=False, size=indices)
 
         if query_sin_emb is None:
-            _axis = 2
-            cos_emb = self.rope.cos_emb.reshape(1, 1, -1, 1, 64)
-            sin_emb = self.rope.sin_emb.reshape(1, 1, -1, 1, 64)
+            _axis = 0
+            cos_emb = self.rope.cos_emb.reshape(-1, self.headdim)
+            sin_emb = self.rope.sin_emb.reshape(-1, self.headdim)
+            # cos_emb = self.rope.cos_emb.reshape(1, 1, -1, 1, 64)
+            # sin_emb = self.rope.sin_emb.reshape(1, 1, -1, 1, 64)
             query_sin_emb = mb.gather(
                 x=sin_emb,
-                indices=query_pos,
+                # indices=many_query_pos,
+                indices=indices,
                 axis=_axis,
-                batch_dims=1,
+                batch_dims=0,
                 name="query_sin_emb",
             )
             query_cos_emb = mb.gather(
                 x=cos_emb,
-                indices=query_pos,
+                # indices=many_query_pos,
+                indices=indices,
                 axis=_axis,
-                batch_dims=1,
+                batch_dims=0,
                 name="query_cos_emb",
             )
 
@@ -323,14 +344,19 @@ class Model:
                 else mb.read_state(input=query_sin_emb_state)
             )
 
+        # batch_size = query_pos.shape[0]
         pos_begin = query_pos
-        pos_end = mb.add(x=input_ids.shape[1], y=query_pos, name="end_pos")
+        pos_end = [
+            mb.add(x=qseqlen, y=query_pos[i], name=f"end_pos_{i}")
+            for i in range(len(query_pos))
+        ]
 
-        batch_size = query_pos.shape[0]
-        if batch_size > 1:
-            pos_begin = mb.split(x=pos_begin, axis=0, num_splits=batch_size)
-            pos_end = mb.split(x=pos_end, axis=0, num_splits=batch_size)
-        else:
+        # if batch_size > 1:
+        #     pos_begin = mb.split(x=pos_begin, axis=0, num_splits=batch_size)
+        #     pos_end = mb.split(x=pos_end, axis=0, num_splits=batch_size)
+        # else:
+        #     pos_begin = [pos_begin]
+        #     pos_end = [pos_end]
 
         key_states, value_states = states
         key_states_read, value_states_read = [
@@ -340,7 +366,6 @@ class Model:
 
         key_state = [key_states, key_states_read]
         value_state = [value_states, value_states_read]
-
 
         new_kheads, new_vheads = [], []
         block: Block

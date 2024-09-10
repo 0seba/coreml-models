@@ -9,6 +9,7 @@ from coremltools.converters.mil import Builder as mb, Var
 import coremltools.converters.mil as mil
 from transformers import AutoConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from ml_dtypes import bfloat16
 
 from models.llama import (
     Block,
@@ -31,6 +32,13 @@ from layers import (
     Embedding,
     Head,
 )
+
+
+def safe_get_tensor(tensors, key):
+    tensor = tensors.get_tensor(key)
+    if tensor.dtype == bfloat16:
+        return tensor.astype(np.float32).astype(np.float16)
+    return tensor
 
 
 class Linear(NamedCall):
@@ -78,16 +86,16 @@ def convert_qlinear(
     dtype=np.float32,
 ):
     if bias:
-        bias = tensors.get_tensor(f"{name_prefix}.bias")
+        bias = safe_get_tensor(tensors, f"{name_prefix}.bias")
     else:
         bias = None
     if is_quantized:
         # w, s, b = (
         w, s, lut = (
-            tensors.get_tensor(f"{name_prefix}.weight.weight"),
-            tensors.get_tensor(f"{name_prefix}.weight.scales"),
-            # tensors.get_tensor(f"{name_prefix}.biases"),
-            tensors.get_tensor(f"{name_prefix}.weight.lut"),
+            safe_get_tensor(tensors, f"{name_prefix}.weight.weight"),
+            safe_get_tensor(tensors, f"{name_prefix}.weight.scales"),
+            # safe_get_tensor(tensors, f"{name_prefix}.biases"),
+            safe_get_tensor(tensors, f"{name_prefix}.weight.lut"),
         )
         if channels_first:
             w = expand_dims_for_conv(w)
@@ -109,7 +117,7 @@ def convert_qlinear(
             name=op_name,
         )
     else:
-        w = tensors.get_tensor(f"{name_prefix}.weight")
+        w = safe_get_tensor(tensors, f"{name_prefix}.weight")
         if channels_first:
             w = expand_dims_for_conv(w)
         return Linear(w, bias, op_name, channels_first=channels_first)
@@ -192,15 +200,17 @@ def convert_to_mil(
     channels_first,
     config: Qwen2Config,
     nbits,
+    headdim,
     max_length=2048,
     dtype=np.float16,
     quantized_emb=False,
     split_head=False,
     batch_size=None,
+    unquantized_layers=[],
 ):
     # bits = config.quantization["bits"]
     bits = nbits
-    headdim = 64
+    # headdim = 64
 
     blocks: List[Block] = []
     rope = RoPEEmbedding(
@@ -213,38 +223,57 @@ def convert_to_mil(
     )
 
     for i in range(config.num_hidden_layers):
-        quantized = i != 0 and i != 23
+        quantized = i not in unquantized_layers
+        # quantized = False
         attn_norm = convert_rmsnorm(
-            tensors.get_tensor(f"model.layers.{i}.input_layernorm.weight"),
+            safe_get_tensor(tensors, f"model.layers.{i}.input_layernorm.weight"),
             f"layer_{i}_attention_rmsnorm",
             channels_first,
             dtype,
         )
-        qbias = tensors.get_tensor(f"model.layers.{i}.self_attn.q_proj.bias")
-        kbias = tensors.get_tensor(f"model.layers.{i}.self_attn.k_proj.bias")
-        vbias = tensors.get_tensor(f"model.layers.{i}.self_attn.v_proj.bias")
+        qbias = safe_get_tensor(tensors, f"model.layers.{i}.self_attn.q_proj.bias")
+        kbias = safe_get_tensor(tensors, f"model.layers.{i}.self_attn.k_proj.bias")
+        vbias = safe_get_tensor(tensors, f"model.layers.{i}.self_attn.v_proj.bias")
         qkvb = np.concatenate(
             (qbias, kbias, vbias),
             axis=0,
         )
         if quantized:
             qw, qs, qb = (
-                tensors.get_tensor(f"model.layers.{i}.self_attn.q_proj.weight.weight"),
-                tensors.get_tensor(f"model.layers.{i}.self_attn.q_proj.weight.scales"),
-                # tensors.get_tensor(f"model.layers.{i}.self_attn.q_proj.biases"),
-                tensors.get_tensor(f"model.layers.{i}.self_attn.q_proj.weight.lut"),
+                safe_get_tensor(
+                    tensors, f"model.layers.{i}.self_attn.q_proj.weight.weight"
+                ),
+                safe_get_tensor(
+                    tensors, f"model.layers.{i}.self_attn.q_proj.weight.scales"
+                ),
+                # safe_get_tensor(tensors, f"model.layers.{i}.self_attn.q_proj.biases"),
+                safe_get_tensor(
+                    tensors, f"model.layers.{i}.self_attn.q_proj.weight.lut"
+                ),
             )
             kw, ks, kb = (
-                tensors.get_tensor(f"model.layers.{i}.self_attn.k_proj.weight.weight"),
-                tensors.get_tensor(f"model.layers.{i}.self_attn.k_proj.weight.scales"),
-                tensors.get_tensor(f"model.layers.{i}.self_attn.k_proj.weight.lut"),
-                # tensors.get_tensor(f"model.layers.{i}.self_attn.k_proj.biases"),
+                safe_get_tensor(
+                    tensors, f"model.layers.{i}.self_attn.k_proj.weight.weight"
+                ),
+                safe_get_tensor(
+                    tensors, f"model.layers.{i}.self_attn.k_proj.weight.scales"
+                ),
+                safe_get_tensor(
+                    tensors, f"model.layers.{i}.self_attn.k_proj.weight.lut"
+                ),
+                # safe_get_tensor(tensors, f"model.layers.{i}.self_attn.k_proj.biases"),
             )
             vw, vs, vb = (
-                tensors.get_tensor(f"model.layers.{i}.self_attn.v_proj.weight.weight"),
-                tensors.get_tensor(f"model.layers.{i}.self_attn.v_proj.weight.scales"),
-                tensors.get_tensor(f"model.layers.{i}.self_attn.v_proj.weight.lut"),
-                # tensors.get_tensor(f"model.layers.{i}.self_attn.v_proj.biases"),
+                safe_get_tensor(
+                    tensors, f"model.layers.{i}.self_attn.v_proj.weight.weight"
+                ),
+                safe_get_tensor(
+                    tensors, f"model.layers.{i}.self_attn.v_proj.weight.scales"
+                ),
+                safe_get_tensor(
+                    tensors, f"model.layers.{i}.self_attn.v_proj.weight.lut"
+                ),
+                # safe_get_tensor(tensors, f"model.layers.{i}.self_attn.v_proj.biases"),
             )
 
             # qw, qproj_lut = qweight_to_lut(qw, qs, qb, bits)
@@ -281,8 +310,8 @@ def convert_to_mil(
                 ss = expand_dims_for_conv(ss)
                 bb = expand_dims_for_conv(bb)
             # qkvproj = GQLinear(
-            _bits = int(np.sqrt(bb.shape[-2]))
-            assert _bits**2 == bb.shape[-2]
+            _bits = int(np.log2(bb.shape[-2]))
+            assert 2**_bits == bb.shape[-2]
             qkvproj = LUTLinear(
                 qkvproj_w,
                 lut=bb,
@@ -294,9 +323,15 @@ def convert_to_mil(
                 name=f"block_{i}_attention_qkvproj",
             )
         else:
-            (qw,) = (tensors.get_tensor(f"model.layers.{i}.self_attn.q_proj.weight"),)
-            (kw,) = (tensors.get_tensor(f"model.layers.{i}.self_attn.k_proj.weight"),)
-            (vw,) = (tensors.get_tensor(f"model.layers.{i}.self_attn.v_proj.weight"),)
+            (qw,) = (
+                safe_get_tensor(tensors, f"model.layers.{i}.self_attn.q_proj.weight"),
+            )
+            (kw,) = (
+                safe_get_tensor(tensors, f"model.layers.{i}.self_attn.k_proj.weight"),
+            )
+            (vw,) = (
+                safe_get_tensor(tensors, f"model.layers.{i}.self_attn.v_proj.weight"),
+            )
             qkvproj_w = np.concatenate((qw, kw, vw), axis=0)
             if channels_first:
                 qkvproj_w = expand_dims_for_conv(qkvproj_w)
@@ -329,7 +364,9 @@ def convert_to_mil(
         )
 
         ffn_norm = convert_rmsnorm(
-            tensors.get_tensor(f"model.layers.{i}.post_attention_layernorm.weight"),
+            safe_get_tensor(
+                tensors, f"model.layers.{i}.post_attention_layernorm.weight"
+            ),
             f"layer_{i}_ffn_rmsnorm",
             channels_first,
             dtype,
@@ -347,7 +384,7 @@ def convert_to_mil(
         blocks.append(block)
 
     finalnorm = convert_rmsnorm(
-        tensors.get_tensor(f"model.norm.weight"),
+        safe_get_tensor(tensors, f"model.norm.weight"),
         f"layer_{i}_ffn_rmsnorm",
         channels_first,
         dtype,
@@ -355,16 +392,16 @@ def convert_to_mil(
 
     if quantized_emb:
         # weight, lut = qweight_to_lut(
-        #     tensors.get_tensor("model.embed_tokens.weight"),
-        #     tensors.get_tensor("model.embed_tokens.scales"),
-        #     tensors.get_tensor("model.embed_tokens.biases"),
+        #     safe_get_tensor(tensors, "model.embed_tokens.weight"),
+        #     safe_get_tensor(tensors, "model.embed_tokens.scales"),
+        #     safe_get_tensor(tensors, "model.embed_tokens.biases"),
         #     bits,
         #     as_uint4=False,
         # )
         weight, lut, scales = (
-            tensors.get_tensor("model.embed_tokens.weight.weight"),
-            tensors.get_tensor("model.embed_tokens.weight.lut"),
-            tensors.get_tensor("model.embed_tokens.weight.scales"),
+            safe_get_tensor(tensors, "model.embed_tokens.weight.weight"),
+            safe_get_tensor(tensors, "model.embed_tokens.weight.lut"),
+            safe_get_tensor(tensors, "model.embed_tokens.weight.scales"),
         )
         if bits == 1:
             weight = np.array(weight).astype(mil.mil.types.np_uint1_dtype)
@@ -392,7 +429,11 @@ def convert_to_mil(
             max_size=16536 if split_head else 1_000_000,
         )
     else:
-        weight = tensors.get_tensor("model.embed_tokens.weight")
+        weight = safe_get_tensor(tensors, "model.embed_tokens.weight")
+        # if channels_first:
+        #     weight = expand_dims_for_conv(weight)
+        # else:
+        #     weight = np.transpose(weight)
         emb = Embedding(weight, "token_embedding", channels_first=channels_first)
         head = Head(
             weight,
@@ -408,6 +449,7 @@ def convert_to_mil(
         finalnorm,
         rope,
         Mask(max_length, dtype),
+        headdim,
         channels_first,
     )
 
@@ -422,6 +464,8 @@ def convert(
     apply_initial_embedding,
     apply_lm_head,
     batch_size,
+    headdim,
+    model_config,
 ):
     dtype = mil.input_types.types.fp16
     if channels_first:
@@ -436,11 +480,21 @@ def convert(
             shape = (batch_size, seqlen, 896)
     state_spec = state_spec = [
         mb.StateTensorSpec(
-            (24 * batch_size, 2, cache_len, 64),
+            (
+                model_config.num_hidden_layers * batch_size,
+                model_config.num_key_value_heads,
+                cache_len,
+                headdim,
+            ),
             dtype=mil.input_types.types.fp16,
         ),
         mb.StateTensorSpec(
-            (24 * batch_size, 2, cache_len, 64),
+            (
+                model_config.num_hidden_layers * batch_size,
+                model_config.num_key_value_heads,
+                cache_len,
+                headdim,
+            ),
             dtype=mil.input_types.types.fp16,
         ),
     ]
@@ -455,8 +509,14 @@ def convert(
         input_specs=[
             inp_spec,
             mb.TensorSpec(
-                (batch_size,), dtype=mil.input_types.types.int32
+                # (batch_size,), dtype=mil.input_types.types.int32
+                (1,),
+                dtype=mil.input_types.types.int32,
             ),  # query_pos
+            # mb.TensorSpec(
+            #     (1,), dtype=mil.input_types.types.int32
+            #     # (batch_size,), dtype=mil.input_types.types.int32
+            # ),  # query_pos
             *state_spec,
         ],
         # opset_version=mil.builder.AvailableTarget.iOS17,
@@ -464,13 +524,15 @@ def convert(
     )
     def program(
         input_ids,
-        query_pos,
+        query_pos1,
+        # query_pos2,
         key_cache_state,
         value_cache_state,
     ):
         return mil_model(
             input_ids,
-            query_pos,
+            # [query_pos1, query_pos2],
+            [query_pos1],
             states=[key_cache_state, value_cache_state],
             apply_initial_embedding=apply_initial_embedding,
             apply_lm_head=apply_lm_head,
@@ -483,7 +545,7 @@ def convert(
     pipeline = ct.PassPipeline.DEFAULT
     # TEMP should define a new custom pass
     # pipeline.remove_passes("common::const_elimination")
-    # pipeline.remove_passes({"common::add_int16_cast"})
+    pipeline.remove_passes({"common::add_int16_cast"})
     cml_converted = ct.convert(
         program,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
@@ -517,35 +579,111 @@ def convert(
         print(e)
 
 
+def make_embedding_model(mil_model: Model, save_path):
+    shapes = [
+        (1, seqlen) for seqlen in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)
+    ]
+    enum_shape = mil.input_types.EnumeratedShapes(shapes=shapes)
+
+    @mb.program(
+        input_specs=[
+            mb.TensorSpec(enum_shape.symbolic_shape, dtype=mil.input_types.types.int32)
+        ],
+        opset_version=mil.builder.AvailableTarget.iOS18,
+    )
+    def program(input_ids):
+        return mil_model.embedding(input_ids, channels_first=False)
+
+    print(program)
+
+    pipeline = ct.PassPipeline.DEFAULT
+    pipeline.remove_passes({"common::add_int16_cast"})
+    cml_converted = ct.convert(
+        program,
+        # compute_units=ct.ComputeUnit.CPU_AND_NE,
+        compute_units=ct.ComputeUnit.ALL,
+        compute_precision=ct.precision.FLOAT16,
+        # compute_precision=compute_precision,
+        # minimum_deployment_target=ct.target.iOS17,
+        minimum_deployment_target=ct.target.iOS18,
+        inputs=[
+            ct.TensorType(name="input_ids", shape=ct.EnumeratedShapes(shapes)),
+        ],
+        pass_pipeline=pipeline,
+    )
+
+    if os.path.exists(save_path):
+        shutil.rmtree(save_path)
+    try:
+        cml_converted.save(save_path)
+    except Exception as e:
+        print(e)
+        cml_converted.save(f"F_{save_path}")
+
+    try:
+        print(cml_converted._get_mil_internal())
+    except Exception as e:
+        print(e)
+
+
 if __name__ == "__main__":
-    model_name = "mlx-community/Qwen2-0.5B-Instruct-4bit"
-    # tensors_path = "/Users/seba/.cache/huggingface/hub/models--mlx-community--Qwen2-0.5B-Instruct-4bit/snapshots/107ca40780ff3f9088bac83c2f289f40f335affc/model.safetensors"
-    tensors_path = "/Users/sebastianamenabar/Documents/mydeving/coreml-models/src/quantized_4bit_2.safetensors"
+    model_name = "Qwen/Qwen2-1.5B"
+    from argparse import ArgumentParser
+
+    parser = ArgumentParser(description="Quantize tensors from a safetensors file.")
+    parser.add_argument("--gs", required=True, type=int)
+    parser.add_argument("--headdim", required=True, type=int)
+    parser.add_argument("--qseqlen", required=True, type=int)
+    parser.add_argument(
+        "--bits", type=int, required=True, help="Number of bits for quantization"
+    )
+    parser.add_argument(
+        "--nblocks", type=int, required=True, help="Number of bits for quantization"
+    )
+
+    args = parser.parse_args()
+
+    nbits = args.bits
+    gs = args.gs
+    # tensors_path = "/Users/sebastianamenabar/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B/snapshots/ff3a49fac17555b8dfc4db6709f480cc8f16a9fe/model.safetensors"
+    # tensors_path = "/Users/sebastianamenabar/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B-Instruct/snapshots/c540970f9e29518b1d8f06ab8b24cba66ad77b6d/model.safetensors"
+    # tensors_path = "/Users/sebastianamenabar/.cache/huggingface/hub/models--Qwen--Qwen2-1.5B/snapshots/8a16abf2848eda07cc5253dec660bf1ce007ad7a/model.safetensors"
+    # nbits = 8
+    tensors_path = "/Users/sebastianamenabar/Documents/mydeving/coreml-models/safetensors/Qwen2-1.5B-{}B-GS{}.safetensors"
     model_config: Qwen2Config = AutoConfig.from_pretrained(model_name)
     print(model_config)
     print("Reading tensors")
-    tensors = safe_open(tensors_path, framework="numpy")
+    tensors = safe_open(tensors_path.format(nbits, gs), framework="numpy")
     channels_first = True
-    batch_size = 2
-    qseqlen = 1
+    batch_size = 1
+    qseqlen = args.qseqlen
     cache_len = 512
     quantized_emb = False
     split_head = True
-    nbits = 6
     mil_model = convert_to_mil(
         tensors,
         channels_first,
         model_config,
+        headdim=args.headdim,
         max_length=cache_len,
         quantized_emb=quantized_emb,
         split_head=split_head,
         nbits=nbits,
         batch_size=batch_size,
+        unquantized_layers=(
+            [0, model_config.num_hidden_layers - 1]
+            if nbits != 16
+            else [i for i in range(model_config.num_hidden_layers)]
+        ),
+        # unquantized_layers=[i for i in range(model_config.num_hidden_layers)]
     )
-    num_blocks = 2
+    num_blocks = args.nblocks
+    if num_blocks == -1:
+        num_blocks = model_config.num_hidden_layers
     apply_lm_head = True
     apply_initial_embedding = True
-    filename = f"QWEN-05B-I-4B-LUT-SCALE-{qseqlen}-CACHEL-MILL2NORM-{num_blocks}-BLOCKS-C{'F' if channels_first else 'L'}.mlpackage"
+    # filename = f"QWEN-1.5B-{nbits}B-GS{gs}-LUT-SCALE-{qseqlen}-QL{'-NO-EMB' if apply_lm_head is False else ''}-{num_blocks}-BLOCKS-C{'F' if channels_first else 'L'}.mlpackage"
+    filename = f"QWEN-1.5B-{nbits}B-{qseqlen}-QL{'-NO-EMB' if apply_lm_head is False else ''}-{num_blocks}-BLOCKS-C{'F' if channels_first else 'L'}.mlpackage"
     convert(
         mil_model,
         qseqlen,
@@ -556,4 +694,9 @@ if __name__ == "__main__":
         apply_initial_embedding,
         apply_lm_head,
         batch_size,
+        headdim=args.headdim,
+        model_config=model_config,
+        # unquantized_blocks=[0, num_blocks - 1],
     )
+
+    # make_embedding_model(mil_model, "QWEN-05B-I-EMB.mlpackage")

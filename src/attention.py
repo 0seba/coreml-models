@@ -295,10 +295,10 @@ class RoPEEmbedding:
 
         elif self.implementation == "split_mul":
             cos_emb_1, cos_emb_2 = np.split(
-                cos_emb.T.reshape(1, 64, 2048), indices_or_sections=2, axis=1
+                cos_emb.T.reshape(1, self.headdim, 2048), indices_or_sections=2, axis=1
             )
             sin_emb_1, sin_emb_2 = np.split(
-                sin_emb.T.reshape(1, 64, 2048), indices_or_sections=2, axis=1
+                sin_emb.T.reshape(1, self.headdim, 2048), indices_or_sections=2, axis=1
             )
 
             self.query_cos_emb_1 = mb.gather(

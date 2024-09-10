@@ -199,6 +199,7 @@ class Head:
         return_logits=True,
         cast=True,
         prefix=None,
+        final_cat=True,
     ):
         self.w = w  # has same shape as input embeddings, (vocab_size, hidden dim)
         self.channels_first = channels_first
@@ -213,6 +214,7 @@ class Head:
         self.return_logits = return_logits
         self.cast = cast
         self.prefix = prefix
+        self.final_cat = final_cat
 
     def __call__(self, x, prefix=None, channels_first=None):
         if prefix is None:
@@ -221,6 +223,14 @@ class Head:
             channels_first = self.channels_first
 
         axis = 1 if channels_first else 2
+
+        # In this case we want to share the weights between input embedding and head weights
+        # se we use matmul instead of conv or linear, because both of them apply some transformation to w
+        # if len(self.split_sizes) == 1:
+        #     if channels_first:
+        #         return mb.conv(x=self.w, y=x, name="logits")
+        #     else:
+        #         return mb.linear(x=self.w, y=x, name="logits")
 
         ws = mb.split(
             x=self.w,
@@ -257,7 +267,7 @@ class Head:
                 topk_vals.append(topk_vals_i)
                 topk_indices.append(topk_indices_i)
 
-        output = tuple()
+        output = []
         if self.return_logits:
             logits = mb.concat(
                 values=[logits[i] for i in range(len(self.split_sizes))],
@@ -265,12 +275,12 @@ class Head:
                 name="_logits",
             )
             if self.cast and types.builtin_to_string(x.dtype) == "fp16":
-                logits = mb.cast(x=logits, dtype="fp32", name=f"logits")
-            else:
-                # just for name consistency
-                logits = mb.identity(x=logits, name="logits")
+                logits = [mb.cast(x=logits[0], dtype="fp32", name=f"logits")]
+            # else:
+            #     # just for name consistency
+            #     logits = [mb.identity(x=logits, name="logits")]
 
-            output += (logits,)
+            output += logits
 
         # if self.topk > 0:
         #     topk_vals = mb.concat(values=topk_vals, axis=2)
@@ -279,4 +289,4 @@ class Head:
         #     # topk_indices = mb.
         #     return x, topk_vals, topk_indices
 
-        return output
+        return *output,

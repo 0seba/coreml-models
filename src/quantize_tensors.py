@@ -8,9 +8,11 @@ from multiprocessing import Pool
 import atexit
 from itertools import repeat
 from tqdm import tqdm
+import argparse
 
-LUT_GROUP_SIZE = 4
-NUM_WORKERS = 4  # number of E+P cores
+
+# LUT_GROUP_SIZE = 4
+# NUM_WORKERS = 6  # number of E+P cores
 
 
 def clusterize(arr, bits):
@@ -21,7 +23,9 @@ def clusterize(arr, bits):
     ).reshape(1, 2**bits, 1)
 
 
-def quantize_tensor(tensors, wname: str, shape, numel_thresh, configs, rest, pool):
+def quantize_tensor(
+    tensors, wname: str, shape, numel_thresh, configs, rest, pool, lut_group_size
+):
     w = tensors.get_tensor(wname).float().half().numpy()
     if np.prod(w.shape) < numel_thresh:
         return {wname: w}
@@ -39,9 +43,9 @@ def quantize_tensor(tensors, wname: str, shape, numel_thresh, configs, rest, poo
         bits = rest
 
     if bits is None:
-        # print(
-        #     f"Skipping weight {wname} with {np.prod(w.shape)} elements from configuration"
-        # )
+        print(
+            f"Skipping weight {wname} with {np.prod(w.shape)} elements from configuration"
+        )
         return {wname: w}
 
     # print("Quantizing", wname, bits, w.shape)
@@ -50,7 +54,7 @@ def quantize_tensor(tensors, wname: str, shape, numel_thresh, configs, rest, poo
     per_channel_scale[per_channel_scale == 0] = 1
     w /= per_channel_scale
 
-    arrs = np.split(w, indices_or_sections=w.shape[0] // LUT_GROUP_SIZE)
+    arrs = np.split(w, indices_or_sections=w.shape[0] // lut_group_size)
     # outindices, outlut = [], []
     # for arr in arrs:
     #     indices, lut = clusterize(arr, bits)
@@ -75,18 +79,13 @@ def quantize_tensor(tensors, wname: str, shape, numel_thresh, configs, rest, poo
     }
 
 
-def main(filename, bits, include_original_emb, outfile):
-    configs = {
-        "model.embed_tokens.weight": None,
-        "model.layers.0": None,
-        "model.layers.23": None,
-    }
+def main(filename, bits, include_original_emb, outfile, lut_group_size, num_workers):
     numel_thresh = 10_000
     rest = bits
 
     out_tensors = {}
 
-    pool = Pool(NUM_WORKERS)
+    pool = Pool(num_workers)
     atexit.register(pool.terminate)
     # torch instead of numpy because of bf16
 
@@ -95,6 +94,16 @@ def main(filename, bits, include_original_emb, outfile):
         header_data = f.read(length_of_header)
         header = json.loads(header_data)
 
+    layers = filter(lambda x: x.startswith("model.layers."), header)
+    last_layer_index = max(map(lambda x: int(x.split(".", 3)[-2]), layers))
+    print("Model layers:", last_layer_index)
+
+    configs = {
+        "model.embed_tokens.weight": None,
+        "model.layers.0": None,
+        f"model.layers.{last_layer_index}": None,
+    }
+
     with safe_open(filename, framework="torch") as tensors:
         wname: str
         for wname in tqdm(list(sorted(tensors.keys()))):
@@ -102,7 +111,14 @@ def main(filename, bits, include_original_emb, outfile):
             shape = header[wname]
             out_tensors.update(
                 quantize_tensor(
-                    tensors, wname, shape, numel_thresh, configs, rest, pool
+                    tensors,
+                    wname,
+                    shape,
+                    numel_thresh,
+                    configs,
+                    rest,
+                    pool,
+                    lut_group_size,
                 )
             )
 
@@ -111,12 +127,44 @@ def main(filename, bits, include_original_emb, outfile):
                 tensors.get_tensor("model.embed_tokens.weight").float().half().numpy()
             )
 
+    print("\n".join(list(sorted(out_tensors.keys()))))
     save_file(out_tensors, outfile)
 
 
 if __name__ == "__main__":
-    tfile = "/Users/sebastianamenabar/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B-Instruct/snapshots/c540970f9e29518b1d8f06ab8b24cba66ad77b6d/model.safetensors"
-    bits = 4
     include_original_emb = False
-    outfile = "quantized_4bit_2.safetensors"
-    main(tfile, bits, include_original_emb, outfile)
+    parser = argparse.ArgumentParser(
+        description="Quantize tensors from a safetensors file."
+    )
+    parser.add_argument("tfile", help="Path to the input safetensors file")
+    parser.add_argument(
+        "--bits", type=int, required=True, help="Number of bits for quantization"
+    )
+    parser.add_argument(
+        "--include_original_emb", action="store_true", help="Include original embedding"
+    )
+    parser.add_argument("--outfile", required=True, help="Output file name")
+    parser.add_argument(
+        "--lut_group_size", type=int, required=True, help="LUT group size"
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=8, help="Number of worker processes"
+    )
+
+    args = parser.parse_args()
+
+    # if not args.outfile:
+    #     args.outfile = f"output_{args.bits}B.safetensors"
+
+    main(
+        args.tfile,
+        args.bits,
+        args.include_original_emb,
+        args.outfile,
+        args.lut_group_size,
+        args.num_workers,
+    )
+    # bits = 8
+    # main(tfile, bits, include_original_emb, outfile)
+
+    # outfile = f"Qwen2-0.5B-{bits}B.safetensors"
