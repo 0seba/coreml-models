@@ -457,23 +457,42 @@ class RoPEEmbedding:
 
 class Mask:
     def __init__(self, max_length, dtype=np.float32):
+        self.max_length = max_length
+        self.dtype = dtype
         self.causal_mask = np.expand_dims(
             np.triu(np.full((max_length, max_length), -np.inf, dtype=dtype), 1),
-            axis=0,
+            axis=(0, 1),
         )
 
-    def get_mask(self, indices, static=True):
+    def get_mask(self, indices, static=True, size=None):
+        if size is not None:
+            causal_mask = np.triu(
+                np.full((self.max_length, self.max_length), -np.inf, dtype=self.dtype),
+                1,
+            )
+            causal_mask = causal_mask.reshape(self.max_length, self.max_length)
+            # causal_mask = np.tile(causal_mask, [size.shape[0], 1, 1, 1])
+            mask = mb.gather(
+                x=causal_mask,
+                indices=size,
+                axis=0,
+                batch_dims=0,
+                name="mask_gather",
+            )
+
+            return mask
+
         if not static or is_symbolic(indices.shape):
             mask = mb.gather(
                 x=self.causal_mask,
                 indices=indices,
-                axis=1,
+                axis=2,
                 batch_dims=1 if static else 0,
                 name="mask_gather_0",
             )
             if is_symbolic(indices.shape):
                 mask = mb.gather(
-                    x=mask, indices=indices, axis=2, batch_dims=1, name="mask_gather_1"
+                    x=mask, indices=indices, axis=3, batch_dims=1, name="mask_gather_1"
                 )
             return mask
         else:
@@ -687,7 +706,11 @@ def attention_monstrosity(
         axis = 1
     else:
         axis = 2
-    if types.builtin_to_string(qkv.dtype) == "fp16":
+    if type(qkv) == tuple:
+        dtype = types.builtin_to_string(qkv[0].dtype)
+    else:
+        dtype = types.builtin_to_string(qkv.dtype)
+    if dtype == "fp16":
         hscale = np.float16(headdim**-0.5)
     else:
         hscale = np.float32(headdim**-0.5)
@@ -1256,6 +1279,38 @@ def stateful_attention(
 
         split_key_state = mb.read_state(input=key_state[0])
         split_value_state = mb.read_state(input=value_state[0])
+    elif state_implementation == "interleaved":
+        if block_index % 2 == 0:
+            read_key_state = mb.read_state(input=key_state[0])
+            read_value_state = mb.read_state(input=value_state[0])
+            next_nkvheads = read_key_state.shape[1] - nkvheads
+            split_key_state = mb.split(
+                x=read_key_state,
+                axis=1,
+                split_sizes=[nkvheads, next_nkvheads],
+            )
+            split_value_state = mb.split(
+                x=read_value_state,
+                axis=1,
+                split_sizes=[nkvheads, next_nkvheads],
+            )
+            key_state += [
+                read_key_state,
+                split_key_state[1],
+                new_kheads,
+            ]
+            value_state += [
+                read_value_state,
+                split_value_state[1],
+                new_vheads,
+            ]
+            split_key_state = split_key_state[0]
+            split_value_state = split_value_state[0]
+        else:
+            split_key_state = key_state[2]
+            split_value_state = value_state[2]
+            new_kheads = mb.concat(values=[key_state[3], new_kheads], axis=1)
+            new_vheads = mb.concat(values=[value_state[3], new_vheads], axis=1)
 
     # scatter does not work on ANE
     # _kheads = mb.scatter(
@@ -1281,9 +1336,26 @@ def stateful_attention(
     )
 
     if state_update_at == "attention":
-        mb.coreml_update_state(state=key_state[0], value=_kheads)
-        mb.coreml_update_state(state=key_state[0], value=_vheads)
+        if state_implementation == "interleaved":
+            if block_index % 2 == 1:
+                updated_key_state = mb.scatter(
+                    data=key_state[1],
+                    updates=new_kheads,
+                    axis=2,
+                    indices=query_pos,
+                )
+                updated_value_state = mb.scatter(
+                    data=value_state[1],
+                    updates=new_vheads,
+                    axis=2,
+                    indices=query_pos,
+                )
 
+                mb.coreml_update_state(state=key_state[0], value=updated_key_state)
+                mb.coreml_update_state(state=value_state[0], value=updated_value_state)
+        else:
+            mb.coreml_update_state(state=key_state[0], value=_kheads)
+            mb.coreml_update_state(state=value_state[0], value=_vheads)
 
     # Nor does slice_update
     # begin = mb.repeat()
@@ -1357,7 +1429,6 @@ def stateful_attention(
         name=f"attention_{block_index}_sdpa",
     )
 
-
     # mb.coreml_update_state(state=key_state[0], value=all_kheads)
     # mb.coreml_update_state(state=value_state[0], value=all_vheads)
 
@@ -1382,10 +1453,821 @@ def stateful_attention(
             name=f"attention_{block_index}_out_reshape",
         )
 
-
     if state_implementation == "per_block":
-        return attention , _kheads, _vheads
+        return attention, _kheads, _vheads
     return (attention, new_kheads, new_vheads)  # , kheads, vheads
 
 
-6
+def logsumexp_stateful_attention(
+    qkv,  # (bsz, hdim, seqlength=1) if channels first else (bsz, seqlength=1, hdim)
+    mask,
+    split_key_state,
+    split_value_state,
+    # newk_state,
+    # newv_state,
+    key_state,
+    value_state,
+    headdim,
+    nqheads,
+    nkvheads,
+    qnorm: RMSNorm | None = None,
+    knorm: RMSNorm | None = None,
+    query_sin_emb=None,
+    query_cos_emb=None,
+    channels_first=False,
+    block_index=0,
+    state_implementation="",
+    state_update_at="",
+    query_pos=None,
+    update_index=None,
+    qseqlen=1,
+):
+    if types.builtin_to_string(qkv.dtype) == "fp16":
+        dtype = np.float16
+    else:
+        dtype = np.float32
+    hscale = np.array(headdim**-0.5, dtype=dtype)
+    num_groups = nqheads // nkvheads
+
+    if channels_first:
+        qkv = mb.reshape(
+            x=qkv,
+            shape=[1, nqheads + nkvheads * 2, headdim, qseqlen],
+            name=f"attention_{block_index}_head_reshape",
+        )
+        qkv = mb.transpose(x=qkv, perm=[0, 1, 3, 2])
+        split_heads = mb.split(
+            x=qkv,
+            split_sizes=[num_groups] * nkvheads + [1] * nkvheads * 2,
+            name=f"attention_{block_index}_head_splits",
+            axis=1,
+        )
+        new_qheads, new_kheads, new_vheads = (
+            split_heads[:nkvheads],
+            split_heads[nkvheads:-nkvheads],
+            split_heads[-nkvheads:],
+        )
+        channel_axis = 3
+    else:
+        qkv = mb.reshape(
+            x=qkv,
+            shape=[1, 1, nqheads + nkvheads * 2, 64],
+            name=f"attention_{block_index}_head_reshape",
+        )
+        raise NotImplementedError(
+            "channels_last logsumexp_stateful_attention not implemented"
+        )
+
+    kheads = mb.read_state(input=key_state[0])
+    vheads = mb.read_state(input=value_state[0])
+    kheads = mb.split(x=kheads, num_splits=nkvheads, axis=1)
+    vheads = mb.split(x=vheads, num_splits=nkvheads, axis=1)
+    # kheads = mb.split(x=key_state[0], num_splits=nkvheads, axis=1)
+    # vheads = mb.split(x=value_state[0], num_splits=nkvheads, axis=1)
+
+    if mask is not None:
+        mask = mb.transpose(x=mask, perm=[0, 1, 3, 2])
+
+    if channels_first:
+        attentions = []
+        for i in range(nkvheads):
+            _qheads = new_qheads[i]
+            _newk_heads = new_kheads[i]
+            _kheads = kheads[i]
+            _vheads = vheads[i]
+
+            if qnorm is not None:
+                _qheads = qnorm(
+                    _qheads,
+                    axes=[channel_axis],
+                    prefix=f"attention_{block_index}_group_{i}_q",
+                )
+                new_qheads[i] = _qheads
+            if knorm is not None:
+                _newk_heads = knorm(
+                    _newk_heads,
+                    axes=[channel_axis],
+                    prefix=f"attention_{block_index}_group_{i}_k",
+                )
+                new_kheads[i] = _newk_heads
+            if query_sin_emb is not None:
+                _qheads = RoPEEmbedding.apply_rotary_pos_emb(
+                    _qheads,
+                    query_sin_emb,
+                    query_cos_emb,
+                    prefix=f"attention_{block_index}_group_{i}_q",
+                    axis=channel_axis,
+                )
+                _newk_heads = RoPEEmbedding.apply_rotary_pos_emb(
+                    _newk_heads,
+                    query_sin_emb,
+                    query_cos_emb,
+                    prefix=f"attention_{block_index}_group_{i}_k",
+                    axis=channel_axis,
+                )
+                new_qheads[i] = _qheads
+                new_kheads[i] = _newk_heads
+
+            # (b, heads, dim, klength
+            cache_scores = mb.matmul(
+                x=_kheads,
+                y=_qheads,
+                transpose_y=True,
+                # x=_qheads,
+                # y=_kheads,
+                # transpose_x=True,
+                name=f"attention_{block_index}_group_{i}_cache_scores",
+            )
+            cache_scores = mb.mul(
+                x=cache_scores,
+                y=hscale,
+                name=f"attention_{block_index}_group_{i}_cache_scaled_scores",
+            )
+            if mask is not None:
+                cache_scores = mb.add(
+                    x=cache_scores,
+                    y=mask,
+                    name=f"attention_{block_index}_group_{i}_cache_masked_scaled_scores",
+                )
+            cache_logsum = mb.reduce_log_sum_exp(
+                x=cache_scores,
+                name=f"attention_{block_index}_group_{i}_cache_logsumexp",
+                axes=[2],
+                keep_dims=True,
+            )
+
+            newk_scores = mb.matmul(
+                x=_newk_heads,
+                y=_qheads,
+                transpose_y=True,
+                # x=_qheads,
+                # y=_newk_heads,
+                # transpose_x=True,
+                name=f"attention_{block_index}_group_{i}_newk_scores",
+            )
+            newk_scores = mb.mul(
+                x=newk_scores,
+                y=hscale,
+                name=f"attention_{block_index}_group_{i}_cache_scaled_scores",
+            )
+
+            scores = mb.concat(
+                values=[cache_logsum, newk_scores],
+                name=f"attention_{block_index}_group_{i}_concat",
+                axis=2,
+            )
+            total_logsum = mb.reduce_log_sum_exp(
+                x=scores,
+                name=f"attention_{block_index}_group_{i}_total_logsumexp",
+                axes=[2],
+                keep_dims=True,
+            )
+
+            sm_cache = mb.sub(
+                x=cache_scores,
+                y=total_logsum,
+                name=f"attention_{block_index}_group_{i}_cache_log_weights",
+            )
+            sm_newk = mb.sub(
+                x=newk_scores,
+                y=total_logsum,
+                name=f"attention_{block_index}_group_{i}_newk_log_weights",
+            )
+            sm_cache = mb.exp(
+                x=sm_cache,
+                name=f"attention_{block_index}_group_{i}_cache_weights",
+            )
+            sm_newk = mb.exp(
+                x=sm_newk,
+                name=f"attention_{block_index}_group_{i}_newk_weights",
+            )
+
+            ws_cache = mb.matmul(
+                x=sm_cache,
+                y=_vheads,
+                transpose_x=True,
+                # x=_vheads,
+                # y=sm_cache,
+                # transpose_y=True,
+                name=f"attention_{block_index}_group_{i}_cache_weighted_sum",
+            )
+            ws_newk = mb.matmul(
+                x=sm_newk,
+                y=new_vheads[i],
+                transpose_x=True,
+                # x=new_vheads[i],
+                # y=sm_newk,
+                # transpose_y=True,
+                name=f"attention_{block_index}_group_{i}_newk_weighted_sum",
+            )
+            attention = mb.add(
+                x=ws_cache, y=ws_newk, name=f"attention_{block_index}_group_{i}"
+            )
+            attention = mb.transpose(x=attention, perm=[0, 1, 3, 2])
+            attention = mb.reshape(
+                x=attention,
+                shape=(1, num_groups * headdim, qseqlen),
+                name=f"attention_{block_index}_reshaped",
+            )
+
+            attentions.append(attention)
+
+        return mb.concat(values=attentions, axis=1), new_kheads, new_vheads
+
+
+def slice_update_stateful_attention(
+    qkv,  # (batch, channels, qseqlen) if channels_first else (batch, qseqlen, channels)
+    mask,
+    pos_begin,
+    pos_end,
+    key_cache_state_tuple,  # (state, state_read: (layers, heads, cache len, headdim))
+    value_cache_state_tuple,
+    headdim,
+    nqheads,
+    nkvheads,
+    qnorm: RMSNorm | None = None,
+    knorm: RMSNorm | None = None,
+    query_sin_emb=None,
+    query_cos_emb=None,
+    channels_first=True,
+    block_index=0,
+):
+    qseqlen = qkv.shape[-1] if channels_first else qkv.shape[1]
+    num_groups = nqheads // nkvheads
+    batch_size = qkv.shape[0]
+    total_num_heads = nqheads + nkvheads * 2
+    if channels_first:
+        headdim = qkv.shape[1] // total_num_heads
+    else:
+        headdim = qkv.shape[-1] // total_num_heads
+    if channels_first:
+        # Split qkv into q, k, v, transpose and leave channels last to fit sdpa input signature
+        qkv = mb.reshape(
+            x=qkv,
+            shape=(batch_size, total_num_heads, headdim, qseqlen),
+            name=f"attention_{block_index}_head_reshape",
+        )
+        qkv = mb.transpose(
+            x=qkv,
+            perm=[0, 1, 3, 2],
+            name=f"attention_{block_index}_head_transpose",
+        )
+    else:
+        qkv = mb.reshape(
+            x=qkv,
+            shape=(batch_size, qseqlen, total_num_heads, headdim),
+            name=f"attention_{block_index}_head_reshape",
+        )
+        qkv = mb.transpose(
+            x=qkv,
+            perm=[0, 2, 1, 3],
+            name=f"attention_{block_index}_head_transpose",
+        )
+
+    query, key, value = mb.split(
+        x=qkv,
+        axis=1,
+        split_sizes=[nqheads, nkvheads, nkvheads],
+        name=f"attention_{block_index}_split_qkv_heads",
+    )
+    print(query.shape, key.shape, value.shape)
+
+    channel_axis = 3
+    if qnorm is not None:
+        query = qnorm(
+            query,
+            axes=[channel_axis],
+            prefix=f"attention_{block_index}_q",
+        )
+    if knorm is not None:
+        key = knorm(
+            key,
+            axes=[channel_axis],
+            prefix=f"attention_{block_index}_k",
+        )
+    if query_sin_emb is not None:
+        query = RoPEEmbedding.apply_rotary_pos_emb(
+            query,
+            query_sin_emb,
+            query_cos_emb,
+            prefix=f"attention_{block_index}_q",
+            axis=channel_axis,
+        )
+        key = RoPEEmbedding.apply_rotary_pos_emb(
+            key,
+            query_sin_emb,
+            query_cos_emb,
+            prefix=f"attention_{block_index}_k",
+            axis=channel_axis,
+        )
+    query = mb.split(
+        x=query, axis=1, num_splits=nqheads, name=f"attention_{block_index}_q_splits"
+    )
+    print(key.shape, value.shape)
+
+    # slice_update begin indices HAVE TO COME FROM CONCAT of state rank
+    # num values, so we have to perform this concat once per attention block
+    # since block_index (the layer number) changes
+    update_begin_indices = []
+    update_end_indices = []
+    for i in range(batch_size):
+        # update_begin_indices = mb.concat(
+        update_begin_indices.append(
+            mb.concat(
+                values=(
+                    # np.array([0], dtype=np.int32),
+                    np.array([block_index * batch_size + i], dtype=np.int32),
+                    np.array([0], dtype=np.int32),
+                    pos_begin[i],
+                    np.array([0], dtype=np.int32),
+                ),
+                axis=0,
+                name=f"attention_{block_index}_update_begin_{i}",
+            )
+        )
+        # update_end_pos = mb.add(x=np.array([SEQLEN], dtype=np.int32), y=pos)
+        # update_end_indices = mb.concat(
+        update_end_indices.append(
+            mb.concat(
+                values=(
+                    # np.array([batch_size], dtype=np.int32),
+                    np.array([block_index * batch_size + i + 1], dtype=np.int32),
+                    np.array([nkvheads], dtype=np.int32),
+                    pos_end[i],
+                    np.array([headdim], dtype=np.int32),
+                ),
+                axis=0,
+                name=f"attention_{block_index}_update_end_{i}",
+            )
+        )
+
+    key_cache = key_cache_state_tuple[1]
+    if batch_size > 1:
+        key = mb.split(x=key, axis=0, num_splits=batch_size)
+    else:
+        key = [key]
+    for i in range(batch_size):
+        key_cache = mb.slice_update(
+            x=key_cache,
+            update=key[i],
+            begin=update_begin_indices[i],
+            end=update_end_indices[i],
+            # squeeze mask parameter must be explicit in order for inplace
+            # ANE state update to work
+            squeeze_mask=[
+                False,
+                # True,
+                False,
+                False,
+                False,
+            ],  # using True in layer positions skips use of unsqueeze
+            name=f"attention_{block_index}_updated_key_cache_{i}",
+        )
+        key_cache = mb.coreml_update_state(
+            state=key_cache_state_tuple[0],
+            value=key_cache,
+            name=f"attention_{block_index}_updated_key_state",
+        )
+    key_cache_state_tuple[1] = key_cache
+    key_cache = mb.slice_by_index(
+        x=key_cache,
+        begin=[block_index * batch_size, 0, 0, 0],
+        end=[block_index * batch_size + batch_size, *key_cache.shape[1:]],
+        squeeze_mask=[
+            False,
+            # True,
+            False,
+            False,
+            False,
+        ],
+        name=f"attention_{block_index}_key_cache",
+    )
+    print(key_cache.shape)
+    key_cache = mb.split(
+        x=key_cache,
+        axis=1,
+        num_splits=nkvheads,
+        name=f"attention_{block_index}_key_cache_head",
+    )
+
+    value_cache = value_cache_state_tuple[1]
+    if batch_size > 1:
+        value = mb.split(x=value, axis=0, num_splits=batch_size)
+    else:
+        value = [value]
+    for i in range(batch_size):
+        value_cache = mb.slice_update(
+            x=value_cache,
+            update=value[i],
+            begin=update_begin_indices[i],
+            end=update_end_indices[i],
+            # squeeze mask parameter must be explicit in order for inplace
+            # ANE state update to work
+            squeeze_mask=[
+                False,
+                # True,
+                False,
+                False,
+                False,
+            ],  # using True in layer positions skips use of unsqueeze
+            name=f"attention_{block_index}_updated_value_cache_{i}",
+        )
+        # value_cache = mb.slice_update(
+        #     x=value_cache_state_tuple[1],
+        #     update=value,
+        #     begin=update_begin_indices,
+        #     end=update_end_indices,
+        #     squeeze_mask=[
+        #         False,
+        #         # True,
+        #         False,
+        #         False,
+        #         False,
+        #     ],
+        #     name=f"attention_{block_index}_updated_value_cache",
+        # )
+        value_cache = mb.coreml_update_state(
+            state=value_cache_state_tuple[0],
+            value=value_cache,
+            name=f"attention_{block_index}_updated_value_state",
+        )
+    value_cache_state_tuple[1] = value_cache
+    value_cache = mb.slice_by_index(
+        x=value_cache,
+        begin=[block_index * batch_size, 0, 0, 0],
+        end=[block_index * batch_size + batch_size, *value_cache.shape[1:]],
+        squeeze_mask=[
+            False,
+            # True,
+            False,
+            False,
+            False,
+        ],
+        name=f"attention_{block_index}_slice_current_layer_value_cache",
+    )
+    print(value_cache.shape)
+    value_cache = mb.split(
+        x=value_cache,
+        axis=1,
+        num_splits=nkvheads,
+        name=f"attention_{block_index}_slice_value_cache_heads",
+    )
+
+    print(query[0].shape, key_cache[0], value_cache[1])
+    print(mask.shape)
+
+    # return query, key, value
+    attentions = []
+    for i in range(nkvheads):
+        for j in range(num_groups):
+            attention = mb.scaled_dot_product_attention(
+                query=query[i * num_groups + j],
+                key=key_cache[i],
+                value=value_cache[i],
+                attn_mask=mask,
+                name=f"sdpa_{block_index}_group_{j}_head_{i}",
+            )  # (1, 1, 64)
+            attentions.append(attention)
+
+    # return attentions[0], key, value
+
+    attention = mb.concat(
+        values=attentions,
+        axis=-1,
+        name=f"attention_{block_index}_concat_attention_all_heads",
+    )
+    attention = mb.squeeze(
+        x=attention,
+        axes=[1],
+        name=f"attention_{block_index}_concat_attention_all_heads_squeeze",
+    )
+    if channels_first:
+        attention = mb.transpose(
+            x=attention,
+            perm=[0, 2, 1],
+            name=f"attention_{block_index}_channels_first_retransposed",
+        )
+    return attention, key, value
+
+
+def concat_stateful_attention(
+    qkv,  # (bsz, hdim, seqlength=1) if channels first else (bsz, seqlength=1, hdim)
+    mask,
+    pos_begin,
+    pos_end,
+    # newk_state,
+    # newv_state,
+    key_state,
+    value_state,
+    headdim,
+    nqheads,
+    nkvheads,
+    qnorm: RMSNorm | None = None,
+    knorm: RMSNorm | None = None,
+    query_sin_emb=None,
+    query_cos_emb=None,
+    channels_first=False,
+    block_index=0,
+    state_implementation="",
+    state_update_at="",
+    query_pos=None,
+    update_index=None,
+    qseqlen=1,
+):
+    # if types.builtin_to_string(qkv.dtype) == "fp16":
+    #     dtype = np.float16
+    # else:
+    #     dtype = np.float32
+    # hscale = np.array(headdim**-0.5, dtype=dtype)
+    num_groups = nqheads // nkvheads
+
+    out = []
+    if channels_first:
+        # qkv = mb.reshape(
+        #     x=qkv,
+        #     shape=[1, 1, (nqheads + nkvheads * 2) * headdim, 1, qseqlen],
+        #     name=f"attention_{block_index}_head_reshape",
+        # )
+        # new_qheads, new_kheads, new_vheads = mb.split(
+        #     x=qkv,
+        #     split_sizes=[nqheads * headdim] + [nkvheads * headdim] * 2,
+        #     axis=2,
+        # )
+        new_qheads, new_kheads, new_vheads = qkv
+        # new_kheads = mb.expand_dims(x=new_kheads, axes=[1])
+        # new_vheads = mb.expand_dims(x=new_vheads, axes=[1])
+
+        # qkv = mb.transpose(x=qkv, perm=[0, 1, 3, 2])
+        # split_heads = mb.split(
+        #     x=qkv,
+        #     split_sizes=[nqheads] + [nkvheads] + [nkvheads],
+        #     name=f"attention_{block_index}_head_splits",
+        #     axis=1,
+        # )
+        # new_qheads, new_kheads, new_vheads = (
+        #     split_heads[0],
+        #     split_heads[1],
+        #     split_heads[2],
+        # )
+        # new_qheads = mb.identity(
+        #     x=new_qheads, name=f"attention_{block_index}_q"
+        # )
+        # new_kheads = mb.identity(
+        #     x=new_kheads, name=f"attention_{block_index}_k"
+        # )
+        # new_vheads = mb.identity(
+        #     x=new_vheads, name=f"attention_{block_index}_v"
+        # )
+        channel_axis = 3
+        if qnorm is not None:
+            new_qheads = qnorm(
+                new_qheads,
+                axes=[channel_axis],
+                prefix=f"attention_{block_index}_q",
+            )
+        if knorm is not None:
+            new_kheads = knorm(
+                new_kheads,
+                axes=[channel_axis],
+                prefix=f"attention_{block_index}_k",
+            )
+        if query_sin_emb is not None:
+            new_qheads = RoPEEmbedding.apply_rotary_pos_emb(
+                new_qheads,
+                query_sin_emb,
+                query_cos_emb,
+                prefix=f"attention_{block_index}_q",
+                axis=channel_axis,
+            )
+            new_kheads = RoPEEmbedding.apply_rotary_pos_emb(
+                new_kheads,
+                query_sin_emb,
+                query_cos_emb,
+                prefix=f"attention_{block_index}_k",
+                axis=channel_axis,
+            )
+
+        # out += [new_kheads, new_vheads]
+        # new_qheads = mb.split(
+        #     x=new_qheads,
+        #     num_splits=nqheads,
+        #     axis=1,
+        #     name=f"attention_{block_index}_new_qheads",
+        # )
+        # new_kheads = mb.split(
+        #     x=new_kheads,
+        #     num_splits=nkvheads,
+        #     axis=1,
+        #     name=f"attention_{block_index}_new_kheads",
+        # )
+        # new_vheads = mb.split(
+        #     x=new_vheads,
+        #     num_splits=nkvheads,
+        #     axis=1,
+        #     name=f"attention_{block_index}_new_vheads",
+        # )
+    else:
+        qkv = mb.reshape(
+            x=qkv,
+            shape=[1, 1, nqheads + nkvheads * 2, 64],
+            name=f"attention_{block_index}_head_reshape",
+        )
+        raise NotImplementedError(
+            "channels_last logsumexp_stateful_attention not implemented"
+        )
+
+    # kheads = mb.read_state(input=key_state[0])
+    # vheads = mb.read_state(input=value_state[0])
+    # kheads = mb.split(x=kheads, num_splits=nkvheads, axis=1)
+    # vheads = mb.split(x=vheads, num_splits=nkvheads, axis=1)
+    # kheads = mb.split(x=key_state[0], num_splits=nkvheads, axis=1)
+    # vheads = mb.split(x=value_state[0], num_splits=nkvheads, axis=1)
+
+    # state = mb.read_state(
+    #     input=key_state[0], name=f"attention_{block_index}_read_state"
+    # )
+    # state = mb.split(
+    #     x=state,
+    #     num_splits=nkvheads * 2,
+    #     axis=1,
+    #     name=f"attention_{block_index}_split_state",
+    # )
+    new_kheads = mb.squeeze(x=new_kheads)
+    new_vheads = mb.squeeze(x=new_vheads)
+    key_state_read = mb.read_state(input=key_state[0])
+    updated_kcache = mb.slice_update(
+        x=key_state_read,
+        update=new_kheads,
+        begin=split_key_state,
+        end=split_value_state,
+        squeeze_mask=[True, False],
+    )
+    _kheads = mb.coreml_update_state(state=key_state[0], value=updated_kcache)
+    value_state_read = mb.read_state(input=value_state[0])
+    updated_vcache = mb.slice_update(
+        x=value_state_read,
+        update=new_vheads,
+        begin=split_key_state,
+        end=split_value_state,
+        squeeze_mask=[True, False],
+    )
+    _vheads = mb.coreml_update_state(state=value_state[0], value=updated_vcache)
+
+    # updated_kcache = mb.read_state(input=key_state[0])
+    # updated_vcache = mb.read_state(input=value_state[0])
+    # _kheads = mb.slice_by_index(
+    #     x=updated_kcache,
+    #     begin=[0, 0, 0, 0, 0],
+    #     end=[1, 1, headdim * nkvheads, 1, 512],
+    # )
+    _kheads = mb.reshape(x=_kheads, shape=[1, 512, nkvheads, headdim])
+    _kheads = mb.transpose(x=_kheads, perm=[0, 2, 1, 3])
+    _kheads = mb.split(x=_kheads, axis=1, num_splits=nkvheads)
+    # _vheads = mb.slice_by_index(
+    #     x=updated_vcache,
+    #     begin=[0, 0, 0, 0, 0],
+    #     end=[1, 1, nkvheads * headdim, 1, 512],
+    # )
+    _vheads = mb.reshape(x=_vheads, shape=[1, 512, nkvheads, headdim])
+    _vheads = mb.transpose(x=_vheads, perm=[0, 2, 1, 3])
+    _vheads = mb.split(x=_vheads, axis=1, num_splits=nkvheads)
+
+    new_qheads = mb.reshape(x=new_qheads, shape=[1, nqheads, headdim, qseqlen])
+    new_qheads = mb.transpose(x=new_qheads, perm=[0, 1, 3, 2])
+    new_qheads = mb.split(x=new_qheads, axis=1, num_splits=nqheads)
+
+    if channels_first:
+        attentions = []
+        for i in range(nkvheads):
+            # _key_state = key_state[i]
+            # _kheads = mb.read_state(
+            #     input=_key_state, name=f"attention_{block_index}_k_cache_{i}"
+            # )
+            # _value_state = value_state[i]
+            # _vheads = mb.read_state(
+            #     input=_value_state, name=f"attention_{block_index}_v_cache_{i}"
+            # )
+            # _kheads = all_kheads[2 * i]
+            # _kheads = all_kheads[i]
+            # _vheads = state[2 * i + 1]
+            # _vheads = all_vheads[i]
+
+            # _qheads = new_qheads[i]
+            # _newk_heads = new_kheads[i]
+            # _new_vheads = new_vheads[i]
+
+            # if qnorm is not None:
+            #     _qheads = qnorm(
+            #         _qheads,
+            #         axes=[channel_axis],
+            #         prefix=f"attention_{block_index}_group_{i}_q",
+            #     )
+            #     new_qheads[i] = _qheads
+            # if knorm is not None:
+            #     _newk_heads = knorm(
+            #         _newk_heads,
+            #         axes=[channel_axis],
+            #         prefix=f"attention_{block_index}_group_{i}_k",
+            #     )
+            #     new_kheads[i] = _newk_heads
+            # if query_sin_emb is not None:
+            #     _qheads = RoPEEmbedding.apply_rotary_pos_emb(
+            #         _qheads,
+            #         query_sin_emb,
+            #         query_cos_emb,
+            #         prefix=f"attention_{block_index}_group_{i}_q",
+            #         axis=channel_axis,
+            #     )
+            #     _newk_heads = RoPEEmbedding.apply_rotary_pos_emb(
+            #         _newk_heads,
+            #         query_sin_emb,
+            #         query_cos_emb,
+            #         prefix=f"attention_{block_index}_group_{i}_k",
+            #         axis=channel_axis,
+            #     )
+            #     new_qheads[i] = _qheads
+            #     new_kheads[i] = _newk_heads
+
+            # _kheads = mb.scatter(data=_kheads, updates=_newk_heads, indices=query_pos, axis=2)
+            # _vheads = mb.scatter(data=_vheads, updates=new_vheads[i], indices=query_pos, axis=2)
+            # _kheads = mb.slice_update(x=_kheads, update=_newk_heads, begin=[0, 0, 0, 0], end=[1, 1, 1, 64])
+            # _vheads = mb.slice_update(x=_vheads, update=new_vheads[i], begin=[0, 0, 0, 0], end=[1, 1, 1, 64])
+            # mb.coreml_update_state(state=_key_state, value=_kheads)
+            # mb.coreml_update_state(state=_value_state, value=_vheads)
+
+            # By performing slice first I have the unsupported idea (hope) that the same memory
+            # may be used
+
+            # _kheads = mb.slice_by_size(x=_kheads, begin=[0, 0, 1, 0], size=[-1, -1, -1, -1])
+            # _vheads = mb.slice_by_size(x=_vheads, begin=[0, 0, 1, 0], size=[-1, -1, -1, -1])
+
+            # Does not work on ANE
+            # mb.coreml_update_state(state=split_key_state[i], value=_newk_heads)
+            # mb.coreml_update_state(state=split_value_state[i], value=new_vheads[i])
+
+            # _kheads = mb.concat(
+            #     values=[_newk_heads, _kheads],
+            #     axis=2,
+            #     name=f"attention_{block_index}_full_k_{i}",
+            # )
+            # _vheads = mb.concat(
+            #     values=[_new_vheads, _vheads],
+            #     axis=2,
+            #     name=f"attention_{block_index}_full_v_{i}",
+            # )
+
+            # Does not work on ANE
+            # _kheads = mb.slice_by_size(x=_kheads, begin=[0, 0, 1, 0], size=[-1, -1, 511, -1])
+            # _vheads = mb.slice_by_size(x=_vheads, begin=[0, 0, 1, 0], size=[-1, -1, 511, -1])
+            # mb.coreml_update_state(state=_key_state, value=_kheads)
+            # mb.coreml_update_state(state=_value_state, value=_vheads)
+
+            # _qheads = mb.split(
+            #     x=_qheads,
+            #     axis=1,
+            #     num_splits=num_groups,
+            #     name=f"attention_{block_index}_new_q_{i}",
+            # )
+
+            for j in range(num_groups):
+                attention = mb.scaled_dot_product_attention(
+                    # query=_qheads[j],
+                    query=new_qheads[i * num_groups + j],
+                    # query=mb.gather(x=_qheads, axis=1, indices=[j]),
+                    # query=mb.slice_by_size(x=_qheads, begin=[0, j, 0, 0], size=[-1, 1, -1, -1]),
+                    key=_kheads[i],
+                    value=_vheads[i],
+                    attn_mask=mask,
+                    name=f"attention_{block_index}_attention_{i}_{j}",
+                )
+
+                attentions.append(attention)
+
+            # attention = mb.scaled_dot_product_attention(
+            #     query=_qheads,
+            #     key=mb.tile(x=_kheads, reps=[1, num_groups, 1, 1]),
+            #     value=mb.tile(x=_vheads, reps=[1, num_groups, 1, 1]),
+            #     attn_mask=mask,
+            # )
+
+            # attentions.append(attention)
+
+        attention = mb.concat(
+            values=attentions,
+            axis=1,
+            name=f"attention_{block_index}_attention_all_heads",
+        )
+        attention = mb.transpose(
+            x=attention,
+            perm=[0, 1, 3, 2],
+            name=f"attention_{block_index}_attention_retransposed",
+        )
+        attention = mb.reshape(
+            x=attention,
+            shape=(1, nqheads * headdim, qseqlen),
+            name=f"attention_{block_index}_reshaped",
+        )
+        # return attention, new_kheads, new_vheads
+        return (
+            attention,
+        )  # split_key_state, split_value_state # , updated_kcache, updated_vcache
