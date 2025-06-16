@@ -1,3 +1,4 @@
+from functools import partial
 import numpy as np
 
 import coremltools as ct
@@ -53,13 +54,30 @@ class RoPEEmbedding:
         freq_constant=10_000,
         dtype=np.float32,
         implementation="split_concat",
+        rope_scaling={},
     ):
+        if rope_scaling is None:
+            rope_scaling = {} # some bug hardcode fix
         self.hdim = hdim
         self.channels_first = channels_first
         self.freq_constant = freq_constant
         self.dtype = dtype
         self.length = max(qlen, klen)
         self.implementation = implementation
+        rope_type = rope_scaling.get("rope_type", None)
+        print(rope_type)
+        if rope_type == "llama3":
+            self.rope_init_fn = partial(
+                RoPEEmbedding._compute_llama3_parameters,
+                factor=rope_scaling["factor"],
+                low_freq_factor=rope_scaling["low_freq_factor"],
+                high_freq_factor=rope_scaling["high_freq_factor"],
+                original_max_position_embeddings=rope_scaling[
+                    "original_max_position_embeddings"
+                ],
+            )
+        else:
+            self.rope_init_fn = RoPEEmbedding._compute_default_rope_parameters
         self.cos_emb, self.sin_emb, self.M = self.compute_rope_embedding(
             hdim,
             freq_constant,
@@ -408,10 +426,63 @@ class RoPEEmbedding:
         )
 
     @staticmethod
-    def compute_rope_embedding(hdim, rope_freq_constant, length, dtype):
+    def _compute_default_rope_parameters(hdim, rope_freq_constant):
         inv_freq = 1.0 / (
             rope_freq_constant ** ((np.arange(0, hdim, 2, dtype=np.float32)) / hdim)
         )
+        attention_factor = 1.0
+        return inv_freq, attention_factor
+
+    @staticmethod
+    def _compute_llama3_parameters(
+        hdim,
+        rope_freq_constant,
+        factor,
+        low_freq_factor,
+        high_freq_factor,
+        original_max_position_embeddings,
+    ):
+        print("Using llama 3 rope parameters")
+        inv_freq, attention_factor = RoPEEmbedding._compute_default_rope_parameters(
+            hdim, rope_freq_constant
+        )
+
+        # factor = config.rope_scaling["factor"]  # `8` in the original implementation
+        # low_freq_factor = config.rope_scaling["low_freq_factor"]  # `1` in the original implementation
+        # high_freq_factor = config.rope_scaling["high_freq_factor"]  # `4` in the original implementation
+        # old_context_len = config.rope_scaling["original_max_position_embeddings"]  # `8192` in the original implementation
+        old_context_len = original_max_position_embeddings
+
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+
+        wavelen = 2 * np.pi / inv_freq
+        # wavelen < high_freq_wavelen: do nothing
+        # wavelen > low_freq_wavelen: divide by factor
+        inv_freq_llama = np.where(
+            wavelen > low_freq_wavelen, inv_freq / factor, inv_freq
+        )
+        # otherwise: interpolate between the two, using a smooth factor
+        smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
+            high_freq_factor - low_freq_factor
+        )
+        smoothed_inv_freq = (
+            1 - smooth_factor
+        ) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+        is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+        inv_freq_llama = np.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+
+        return inv_freq_llama, attention_factor
+
+    # @staticmethod
+    def compute_rope_embedding(self, hdim, rope_freq_constant, length, dtype):
+        # inv_freq = 1.0 / (
+        #     rope_freq_constant ** ((np.arange(0, hdim, 2, dtype=np.float32)) / hdim)
+        # )
+        # inv_freq, attention_scaling = RoPEEmbedding._compute_default_rope_parameters(
+        #     hdim, rope_freq_constant
+        # )
+        inv_freq, attention_scaling = self.rope_init_fn(hdim, rope_freq_constant)
         pos_index = np.arange(length, dtype=np.float32)
         pos_index_theta = np.einsum("i,j->ij", pos_index, inv_freq)
         emb = np.concatenate((pos_index_theta, pos_index_theta), axis=-1)
@@ -419,17 +490,21 @@ class RoPEEmbedding:
         _sin_emb = np.sin(pos_index_theta)
         sin_emb = np.sin(emb)
 
-        M = (
-            np.vectorize(np.diag, signature="(n)->(n,n)")(cos_emb)
-            - np.vectorize(np.diag, signature="(n),()->(2n,2n)")(_sin_emb, hdim // 2)
-            + np.vectorize(np.diag, signature="(n),()->(2n,2n)")(_sin_emb, -hdim // 2)
-        )
+        # M = (
+        #     np.vectorize(np.diag, signature="(n)->(n,n)")(cos_emb)
+        #     - np.vectorize(np.diag, signature="(n),()->(2n,2n)")(_sin_emb, hdim // 2)
+        #     + np.vectorize(np.diag, signature="(n),()->(2n,2n)")(_sin_emb, -hdim // 2)
+        # )
+        # M = M.astype(dtype).reshape(1, hdim, length, hdim)
+        M = None
+        cos_emb = (cos_emb * attention_scaling).astype(dtype)
+        sin_emb = (sin_emb * attention_scaling).astype(dtype)
 
         return (
-            cos_emb.astype(dtype),  # .T.reshape(hdim, 1, length),
-            sin_emb.astype(dtype),  # .T.reshape(hdim, 1, length),
+            cos_emb,  # .T.reshape(hdim, 1, length),
+            sin_emb,  # .T.reshape(hdim, 1, length),
             # np.expand_dims(M.astype(dtype).T, 0),
-            M.astype(dtype).reshape(1, hdim, length, hdim),
+            M,
         )
 
     @staticmethod
@@ -1691,6 +1766,7 @@ def slice_update_stateful_attention(
     query_cos_emb=None,
     channels_first=True,
     block_index=0,
+    shift=0,
 ):
     qseqlen = qkv.shape[-1] if channels_first else qkv.shape[1]
     num_groups = nqheads // nkvheads
@@ -1760,9 +1836,17 @@ def slice_update_stateful_attention(
             prefix=f"attention_{block_index}_k",
             axis=channel_axis,
         )
-    query = mb.split(
-        x=query, axis=1, num_splits=nqheads, name=f"attention_{block_index}_q_splits"
-    )
+    if num_groups > 1:
+        niter = nkvheads
+        query = mb.split(
+            x=query,
+            axis=1,
+            num_splits=nkvheads,
+            name=f"attention_{block_index}_q_splits",
+        )
+    else:
+        niter = 1
+        query = [query]
     print(key.shape, value.shape)
 
     # slice_update begin indices HAVE TO COME FROM CONCAT of state rank
@@ -1776,7 +1860,7 @@ def slice_update_stateful_attention(
             mb.concat(
                 values=(
                     # np.array([0], dtype=np.int32),
-                    np.array([block_index * batch_size + i], dtype=np.int32),
+                    np.array([(block_index - shift) * batch_size + i], dtype=np.int32),
                     np.array([0], dtype=np.int32),
                     pos_begin[i],
                     np.array([0], dtype=np.int32),
@@ -1791,7 +1875,9 @@ def slice_update_stateful_attention(
             mb.concat(
                 values=(
                     # np.array([batch_size], dtype=np.int32),
-                    np.array([block_index * batch_size + i + 1], dtype=np.int32),
+                    np.array(
+                        [(block_index - shift) * batch_size + i + 1], dtype=np.int32
+                    ),
                     np.array([nkvheads], dtype=np.int32),
                     pos_end[i],
                     np.array([headdim], dtype=np.int32),
@@ -1831,8 +1917,8 @@ def slice_update_stateful_attention(
     key_cache_state_tuple[1] = key_cache
     key_cache = mb.slice_by_index(
         x=key_cache,
-        begin=[block_index * batch_size, 0, 0, 0],
-        end=[block_index * batch_size + batch_size, *key_cache.shape[1:]],
+        begin=[(block_index - shift) * batch_size, 0, 0, 0],
+        end=[(block_index - shift) * batch_size + batch_size, *key_cache.shape[1:]],
         squeeze_mask=[
             False,
             # True,
@@ -1843,12 +1929,15 @@ def slice_update_stateful_attention(
         name=f"attention_{block_index}_key_cache",
     )
     print(key_cache.shape)
-    key_cache = mb.split(
-        x=key_cache,
-        axis=1,
-        num_splits=nkvheads,
-        name=f"attention_{block_index}_key_cache_head",
-    )
+    if num_groups > 1:
+        key_cache = mb.split(
+            x=key_cache,
+            axis=1,
+            num_splits=nkvheads,
+            name=f"attention_{block_index}_key_cache_head",
+        )
+    else:
+        key_cache = [key_cache]
 
     value_cache = value_cache_state_tuple[1]
     if batch_size > 1:
@@ -1894,8 +1983,8 @@ def slice_update_stateful_attention(
     value_cache_state_tuple[1] = value_cache
     value_cache = mb.slice_by_index(
         x=value_cache,
-        begin=[block_index * batch_size, 0, 0, 0],
-        end=[block_index * batch_size + batch_size, *value_cache.shape[1:]],
+        begin=[(block_index - shift) * batch_size, 0, 0, 0],
+        end=[(block_index - shift) * batch_size + batch_size, *value_cache.shape[1:]],
         squeeze_mask=[
             False,
             # True,
@@ -1906,46 +1995,66 @@ def slice_update_stateful_attention(
         name=f"attention_{block_index}_slice_current_layer_value_cache",
     )
     print(value_cache.shape)
-    value_cache = mb.split(
-        x=value_cache,
-        axis=1,
-        num_splits=nkvheads,
-        name=f"attention_{block_index}_slice_value_cache_heads",
-    )
+    if num_groups > 1:
+        value_cache = mb.split(
+            x=value_cache,
+            axis=1,
+            num_splits=nkvheads,
+            name=f"attention_{block_index}_slice_value_cache_heads",
+        )
+    else:
+        value_cache = [value_cache]
 
-    print(query[0].shape, key_cache[0], value_cache[1])
-    print(mask.shape)
+    # print(query[0].shape, key_cache[0], value_cache[1])
+    # print(mask.shape)
 
     # return query, key, value
     attentions = []
-    for i in range(nkvheads):
-        for j in range(num_groups):
-            attention = mb.scaled_dot_product_attention(
-                query=query[i * num_groups + j],
-                key=key_cache[i],
-                value=value_cache[i],
-                attn_mask=mask,
-                name=f"sdpa_{block_index}_group_{j}_head_{i}",
-            )  # (1, 1, 64)
-            attentions.append(attention)
+    mask = mb.transpose(x=mask, perm=[0, 1, 3, 2])
+    for i in range(niter):
+        # for j in range(num_groups):
+        # attention = mb.scaled_dot_product_attention(
+        #     query=query[i * num_groups + j],
+        #     key=key_cache[i],
+        #     value=value_cache[i],
+        #     attn_mask=mask,
+        #     name=f"sdpa_{block_index}_group_{j}_head_{i}",
+        # )  # (1, 1, 64)
+        # score = mb.matmul(x=key_cache[i], y=query[i * num_groups + j], transpose_y=True)
+        score = mb.matmul(x=key_cache[i], y=query[i], transpose_y=True)
+        score = mb.mul(x=score, y=np.array(headdim**-0.5, dtype=np.float16))
+        if mask is not None:
+            score = mb.add(x=score, y=mask)
+        weights = mb.softmax(x=score, axis=-2)
+        attn = mb.matmul(x=weights, y=value_cache[i], transpose_x=True)
+        attentions.append(attn)
 
     # return attentions[0], key, value
 
-    attention = mb.concat(
-        values=attentions,
-        axis=-1,
-        name=f"attention_{block_index}_concat_attention_all_heads",
-    )
-    attention = mb.squeeze(
-        x=attention,
-        axes=[1],
-        name=f"attention_{block_index}_concat_attention_all_heads_squeeze",
-    )
+    if num_groups > 1:
+        # IMPORTANT: concat along the heads axis
+        attention = mb.concat(
+            values=attentions,
+            axis=1,
+            name=f"attention_{block_index}_concat_attention_all_heads",
+        )
+    else:
+        attention = attentions[0]
+    # if num_groups > 1:
+    #     attention = mb.squeeze(
+    #         x=attention,
+    #         axes=[1],
+    #         name=f"attention_{block_index}_concat_attention_all_heads_squeeze",
+    #     )
     if channels_first:
         attention = mb.transpose(
             x=attention,
-            perm=[0, 2, 1],
+            perm=[0, 1, 3, 2],
             name=f"attention_{block_index}_channels_first_retransposed",
+        )
+        attention = mb.reshape(
+            x=attention,
+            shape=[attention.shape[0], nqheads * headdim, attention.shape[-1]],
         )
     return attention, key, value
 

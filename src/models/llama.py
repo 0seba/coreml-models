@@ -114,6 +114,7 @@ class Attention:
         value_state=None,
         query_cos_emb=None,
         query_sin_emb=None,
+        shift=0,
     ):
         qkv = self.qkvproj(hidden_states, name=f"attention_{self.block_index}_qkvproj")
         attention, new_kheads, new_vheads, *_ = slice_update_stateful_attention(
@@ -132,6 +133,7 @@ class Attention:
             query_cos_emb=query_cos_emb,
             channels_first=self.channels_first,
             block_index=self.block_index,
+            shift=shift,
         )
         # return attention, new_kheads, new_vheads
         out = self.outproj(attention, name=f"attention_{self.block_index}_outproj")
@@ -143,7 +145,7 @@ class Attention:
 class Block:
     def __init__(
         self,
-        attn_norm: RMSNorm,
+        attn_norm: RMSNorm | None,
         attn: Attention,
         ffn_norm: RMSNorm,
         ffn: FFN2,
@@ -172,7 +174,9 @@ class Block:
         value_state=None,
         query_sin_emb=None,
         query_cos_emb=None,
+        shift=0,
     ):
+        rest = []
         # if axis is None:
         #     axis = self.axis
         if channels_first is None:
@@ -180,11 +184,15 @@ class Block:
         axis = 1 if channels_first else 2
 
         residual_1 = hidden_states
-        hidden_states_post_attn_norm = self.attn_norm(
-            hidden_states,
-            prefix=f"block_{self.block_index}_attention",
-            axes=[axis],
-        )
+        if self.attn_norm is not None:
+            hidden_states_post_attn_norm = self.attn_norm(
+                hidden_states,
+                prefix=f"block_{self.block_index}_attention",
+                axes=[axis],
+            )
+        else:
+            hidden_states_post_attn_norm = hidden_states
+        rest.append(hidden_states_post_attn_norm)
         hidden_states_post_attn = self.attn(
             hidden_states_post_attn_norm,
             mask=mask,
@@ -195,10 +203,12 @@ class Block:
             value_state=value_state,
             query_cos_emb=query_cos_emb,
             query_sin_emb=query_sin_emb,
+            shift=shift,
         )
         if key_state is not None:
             # return hidden_states_post_attn
             hidden_states_post_attn, new_kheads, new_vheads = hidden_states_post_attn
+        rest.append(hidden_states_post_attn)
         hidden_states = mb.add(
             x=residual_1,
             y=hidden_states_post_attn,
@@ -208,11 +218,13 @@ class Block:
         hidden_states_post_ffn_norm = self.ffn_norm(
             hidden_states, prefix=f"block_{self.block_index}_ffn", axes=[axis]
         )
+        rest.append(hidden_states_post_ffn_norm)
         hidden_states_post_ffn = self.ffn(
             hidden_states_post_ffn_norm,
             prefix=f"block_{self.block_index}",
             axis=axis,
         )
+        rest.append(hidden_states_post_ffn)
         hidden_states = mb.add(
             x=hidden_states_post_ffn,
             y=residual_2,
@@ -220,8 +232,8 @@ class Block:
         )
 
         if key_state is not None:
-            return hidden_states, new_kheads, new_vheads
-        return hidden_states
+            return (hidden_states, rest), new_kheads, new_vheads
+        return (hidden_states, rest)
 
 
 class Model:
@@ -257,6 +269,7 @@ class Model:
         self,
         input_ids=None,
         query_pos=None,
+        indices=None,
         hidden_state_state=None,
         query_pos_state=None,
         mask_state=None,
@@ -273,6 +286,7 @@ class Model:
         shift=0,
         propagate_state=False,
         return_mask_and_pos_emb=True,
+        return_hidden=False,
     ):
         if apply_initial_embedding is None:
             apply_initial_embedding = self.apply_initial_embedding
@@ -293,18 +307,20 @@ class Model:
             many_query_pos = mb.concat(values=query_pos, axis=0)
         else:
             many_query_pos = query_pos[0]
-        if mask is None:
-            indices = np.arange(qseqlen, dtype=np.int32).reshape(
-                many_query_pos.shape[0], 1, qseqlen
-            )
-            many_query_pos = mb.expand_dims(x=many_query_pos, axes=[-1, -2])
-            indices = mb.add(x=indices, y=many_query_pos)
-            mask = self.mask.get_mask(None, static=False, size=indices)
+
+        # if mask is None or query_sin_emb is None:
+        #     indices = np.arange(qseqlen, dtype=np.int32).reshape(
+        #         many_query_pos.shape[0], 1, qseqlen
+        #     )
+        #     many_query_pos = mb.expand_dims(x=many_query_pos, axes=[-1, -2])
+        #     indices = mb.add(x=indices, y=many_query_pos)
+        # if mask is None:
+        #     mask = self.mask.get_mask(None, static=False, size=indices)
 
         if query_sin_emb is None:
-            _axis = 0
-            cos_emb = self.rope.cos_emb.reshape(-1, self.headdim)
-            sin_emb = self.rope.sin_emb.reshape(-1, self.headdim)
+            _axis = 2
+            cos_emb = self.rope.cos_emb.reshape(1, 1, -1, self.headdim)
+            sin_emb = self.rope.sin_emb.reshape(1, 1, -1, self.headdim)
             # cos_emb = self.rope.cos_emb.reshape(1, 1, -1, 1, 64)
             # sin_emb = self.rope.sin_emb.reshape(1, 1, -1, 1, 64)
             query_sin_emb = mb.gather(
@@ -325,7 +341,7 @@ class Model:
             )
 
         if apply_initial_embedding:
-            hidden_states = self.embedding(input_ids)
+            hidden_states = embeddings = self.embedding(input_ids)
         elif input_ids is None:
             hidden_states = mb.read_state(input=hidden_state_state)
         else:
@@ -382,24 +398,32 @@ class Model:
                 value_state=value_state,
                 query_cos_emb=query_cos_emb,
                 query_sin_emb=query_sin_emb,
+                shift=shift,
             )
             if key_state is not None:
                 hidden_states, _new_kheads, _new_vheads = hidden_states
                 new_kheads.append(_new_kheads)
                 new_vheads.append(_new_vheads)
 
+            hidden_states, rest = hidden_states
             all_hidden_states.append(hidden_states)
 
         # return (*all_hidden_states,)  # *new_kheads, *new_vheads
-
-        _hidden_states = self.finalnorm(hidden_states, axes=[axis], prefix="final_norm")
-        if not apply_lm_head:
-
-            out = [_hidden_states]
-            if return_mask_and_pos_emb:
-                out += [mask, query_sin_emb, query_cos_emb]
+        _hidden_states = hidden_states
+        if num_blocks + shift == len(self.blocks):
+            hidden_states = self.finalnorm(
+                hidden_states, axes=[axis], prefix="final_norm"
+            )
+        if apply_lm_head:
+            logits = self.head(hidden_states)
+            return logits
+        else:
+            if return_hidden:
+                out = [hidden_states, _hidden_states]
+            else:
+                out = [hidden_states]
+            return_mask_and_pos_emb = True
+            # if return_mask_and_pos_emb:
+            #     out += [mask, query_sin_emb, query_cos_emb, embeddings, *rest]
 
             return out
-
-        out = self.head(_hidden_states)
-        return out

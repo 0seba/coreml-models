@@ -1,3 +1,4 @@
+import os
 import json
 import struct
 from safetensors import safe_open
@@ -48,7 +49,7 @@ def quantize_tensor(
         )
         return {wname: w}
 
-    # print("Quantizing", wname, bits, w.shape)
+    print(f"Quantizing {wname} to {bits} bits")
 
     per_channel_scale = np.max(np.abs(w), axis=1, keepdims=True)
     per_channel_scale[per_channel_scale == 0] = 1
@@ -79,7 +80,7 @@ def quantize_tensor(
     }
 
 
-def main(filename, bits, include_original_emb, outfile, lut_group_size, num_workers):
+def main(filename: str, bits, include_original_emb, outfile, lut_group_size, num_workers):
     numel_thresh = 10_000
     rest = bits
 
@@ -89,50 +90,68 @@ def main(filename, bits, include_original_emb, outfile, lut_group_size, num_work
     atexit.register(pool.terminate)
     # torch instead of numpy because of bf16
 
-    with open(filename, "rb") as f:
-        length_of_header = struct.unpack("<Q", f.read(8))[0]
-        header_data = f.read(length_of_header)
-        header = json.loads(header_data)
+    if filename.endswith("index.json"):
+        with open(filename, "r") as f:
+            data = json.load(f)["weight_map"]
+            filenames = set(data.values())
+            layers = layers = filter(lambda x: x.startswith("model.layers."), data.keys())
+        dirname = os.path.dirname(filename)
+        filenames = [os.path.join(dirname, fn) for fn in filenames]
+        print(layers)
+        print(filenames)
+    else:
+        with open(filename, "rb") as f:
+            length_of_header = struct.unpack("<Q", f.read(8))[0]
+            header_data = f.read(length_of_header)
+            header = json.loads(header_data)
+        layers = filter(lambda x: x.startswith("model.layers."), header)
+        filenames = [filename]
 
-    layers = filter(lambda x: x.startswith("model.layers."), header)
     last_layer_index = max(map(lambda x: int(x.split(".", 3)[-2]), layers))
     print("Model layers:", last_layer_index)
 
     configs = {
-        "model.embed_tokens.weight": None,
-        "model.layers.0": None,
-        f"model.layers.{last_layer_index}": None,
+        "model.embed_tokens.weight": 6,
+        "lm_head.weight": 6,
+        # "model.layers.0": None,
+        # f"model.layers.{last_layer_index}": None,
     }
 
-    with safe_open(filename, framework="torch") as tensors:
-        wname: str
-        for wname in tqdm(list(sorted(tensors.keys()))):
-            # print("W:", outws.shape, ", LUT:", lut.shape, ", S:", per_channel_scale.shape)
-            shape = header[wname]
-            out_tensors.update(
-                quantize_tensor(
-                    tensors,
-                    wname,
-                    shape,
-                    numel_thresh,
-                    configs,
-                    rest,
-                    pool,
-                    lut_group_size,
+    for filename in filenames:
+        with open(filename, "rb") as f:
+            length_of_header = struct.unpack("<Q", f.read(8))[0]
+            header_data = f.read(length_of_header)
+            header = json.loads(header_data)
+        with safe_open(filename, framework="torch") as tensors:
+            wname: str
+            for wname in tqdm(list(sorted(tensors.keys()))):
+                # print("W:", outws.shape, ", LUT:", lut.shape, ", S:", per_channel_scale.shape)
+                
+                shape = header[wname]
+                out_tensors.update(
+                    quantize_tensor(
+                        tensors,
+                        wname,
+                        shape,
+                        numel_thresh,
+                        configs,
+                        rest,
+                        pool,
+                        lut_group_size,
+                    )
                 )
-            )
 
-        if include_original_emb:
-            out_tensors["model.embed_tokens.weight.original"] = (
-                tensors.get_tensor("model.embed_tokens.weight").float().half().numpy()
-            )
+            if include_original_emb and "model.embed_tokens.weight" in tensors.keys():
+                out_tensors["model.embed_tokens.weight.original"] = (
+                    tensors.get_tensor("model.embed_tokens.weight").float().half().numpy()
+                )
 
     print("\n".join(list(sorted(out_tensors.keys()))))
     save_file(out_tensors, outfile)
 
 
 if __name__ == "__main__":
-    include_original_emb = False
+    # include_original_emb = False
     parser = argparse.ArgumentParser(
         description="Quantize tensors from a safetensors file."
     )

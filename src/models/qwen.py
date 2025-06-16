@@ -2,6 +2,10 @@ import os
 import shutil
 from typing import List
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import numpy as np
 from safetensors import safe_open
 import coremltools as ct
@@ -34,7 +38,10 @@ from layers import (
 )
 
 
-def safe_get_tensor(tensors, key):
+def safe_get_tensor(tensors, key: str):
+    # TEMP
+    if key.endswith(".scales") and key.rstrip("s") in tensors.keys():
+        key = key.rstrip("s")
     tensor = tensors.get_tensor(key)
     if tensor.dtype == bfloat16:
         return tensor.astype(np.float32).astype(np.float16)
@@ -66,9 +73,11 @@ class Linear(NamedCall):
         return x
 
 
-def expand_dims_for_conv(weight):
+def expand_dims_for_conv(*weights):
     # if len(weight.shape) == 2:
-    return np.expand_dims(weight, 2)
+    if len(weights) > 1:
+        return (np.expand_dims(weight, 2) for weight in weights)
+    return np.expand_dims(weights[0], 2)
     # elif weight.shape[2] != 1:
     #     raise f"Channels first weight with 3rd dim !=1, shape: {weight.shape}"
     # return weight
@@ -206,7 +215,10 @@ def convert_to_mil(
     quantized_emb=False,
     split_head=False,
     batch_size=None,
+    shared_emb_lm_head=False,
+    quantized_lm_head=False,
     unquantized_layers=[],
+    use_original_emb=False,
 ):
     # bits = config.quantization["bits"]
     bits = nbits
@@ -220,6 +232,7 @@ def convert_to_mil(
         freq_constant=config.rope_theta,
         channels_first=channels_first,
         dtype=np.float16,
+        rope_scaling=getattr(config, "rope_scaling", {}),
     )
 
     for i in range(config.num_hidden_layers):
@@ -231,13 +244,14 @@ def convert_to_mil(
             channels_first,
             dtype,
         )
-        qbias = safe_get_tensor(tensors, f"model.layers.{i}.self_attn.q_proj.bias")
-        kbias = safe_get_tensor(tensors, f"model.layers.{i}.self_attn.k_proj.bias")
-        vbias = safe_get_tensor(tensors, f"model.layers.{i}.self_attn.v_proj.bias")
-        qkvb = np.concatenate(
-            (qbias, kbias, vbias),
-            axis=0,
-        )
+        qkvb = None
+        # qbias = safe_get_tensor(tensors, f"model.layers.{i}.self_attn.q_proj.bias")
+        # kbias = safe_get_tensor(tensors, f"model.layers.{i}.self_attn.k_proj.bias")
+        # vbias = safe_get_tensor(tensors, f"model.layers.{i}.self_attn.v_proj.bias")
+        # qkvb = np.concatenate(
+        #     (qbias, kbias, vbias),
+        #     axis=0,
+        # )
         if quantized:
             qw, qs, qb = (
                 safe_get_tensor(
@@ -390,6 +404,7 @@ def convert_to_mil(
         dtype,
     )
 
+    max_size = 16_384
     if quantized_emb:
         # weight, lut = qweight_to_lut(
         #     safe_get_tensor(tensors, "model.embed_tokens.weight"),
@@ -403,31 +418,47 @@ def convert_to_mil(
             safe_get_tensor(tensors, "model.embed_tokens.weight.lut"),
             safe_get_tensor(tensors, "model.embed_tokens.weight.scales"),
         )
-        if bits == 1:
+        _bits = np.log2(lut.shape[-2])
+        if _bits == 1:
             weight = np.array(weight).astype(mil.mil.types.np_uint1_dtype)
-        elif bits == 2:
+        elif _bits == 2:
             weight = np.array(weight).astype(mil.mil.types.np_uint2_dtype)
-        elif bits == 3:
+        elif _bits == 3:
             weight = np.array(weight).astype(mil.mil.types.np_uint3_dtype)
-        elif bits == 4:
+        elif _bits == 4:
             weight = np.array(weight).astype(mil.mil.types.np_uint4_dtype)
-        elif bits == 6:
+        elif _bits == 6:
             weight = np.array(weight).astype(mil.mil.types.np_uint6_dtype)
-        emb = QEmbedding(
-            weight,
-            lut,
-            scales=scales,
-            nbits=bits,
-            channels_first=channels_first,
-            name="token_embedding",
-        )
-        head = QHead(
-            weight,
-            lut,
-            channels_first=channels_first,
-            name="lm_head",
-            max_size=16536 if split_head else 1_000_000,
-        )
+
+        if use_original_emb:
+            # if channels_first:
+            #     weight = expand_dims_for_conv(weight)
+            # else:
+            #     weight = np.transpose(weight)
+            emb = Embedding(
+                safe_get_tensor(tensors, "model.embed_tokens.weight.original"),
+                "token_embedding",
+                channels_first=channels_first,
+            )
+        else:
+            emb = QEmbedding(
+                weight,
+                lut,
+                scales=scales,
+                nbits=bits,
+                channels_first=channels_first,
+                name="token_embedding",
+            )
+        if shared_emb_lm_head:
+            weight, lut, scales = expand_dims_for_conv(weight, lut, scales)
+            head = QHead(
+                weight,
+                lut,
+                channels_first=channels_first,
+                s=scales,
+                name="lm_head",
+                max_size=max_size if split_head else 1_000_000,
+            )
     else:
         weight = safe_get_tensor(tensors, "model.embed_tokens.weight")
         # if channels_first:
@@ -435,12 +466,53 @@ def convert_to_mil(
         # else:
         #     weight = np.transpose(weight)
         emb = Embedding(weight, "token_embedding", channels_first=channels_first)
-        head = Head(
-            weight,
-            split_size=16384 if split_head else 1_000_000,
-            channels_first=channels_first,
-            prefix="lm_head",
-        )
+        if shared_emb_lm_head:
+            head = Head(
+                weight,
+                split_size=max_size if split_head else 1_000_000,
+                channels_first=channels_first,
+                prefix="lm_head",
+            )
+
+    if not shared_emb_lm_head:
+        if quantized_lm_head:
+            # lm_head_tensors = safe_open("/Users/sebastianamenabar/Documents/mydeving/coreml-models/safetensors/llama_2_7b_chat_head_4bit_uw.safetensors", framework="numpy")
+            lm_head_tensors = tensors
+
+            weight, lut, scales = (
+                safe_get_tensor(lm_head_tensors, "lm_head.weight.weight"),
+                safe_get_tensor(lm_head_tensors, "lm_head.weight.lut"),
+                safe_get_tensor(lm_head_tensors, "lm_head.weight.scales"),
+            )
+            # lut = np.expand_dims(lut, axis=(-1, -3))
+            weight, lut, scales = expand_dims_for_conv(weight, lut, scales)
+            _bits = np.log2(lut.shape[-2])
+            if _bits == 1:
+                weight = np.array(weight).astype(mil.mil.types.np_uint1_dtype)
+            elif _bits == 2:
+                weight = np.array(weight).astype(mil.mil.types.np_uint2_dtype)
+            elif _bits == 3:
+                weight = np.array(weight).astype(mil.mil.types.np_uint3_dtype)
+            elif _bits == 4:
+                weight = np.array(weight).astype(mil.mil.types.np_uint4_dtype)
+            elif _bits == 6:
+                weight = np.array(weight).astype(mil.mil.types.np_uint6_dtype)
+            head = QHead(
+                weight,
+                lut,
+                channels_first=channels_first,
+                s=scales,
+                name="lm_head",
+                max_size=max_size if split_head else 1_000_000,
+            )
+        else:
+            weight = safe_get_tensor(tensors, "lm_head.weight")
+            head = Head(
+                weight,
+                split_size=max_size if split_head else 1_000_000,
+                channels_first=channels_first,
+                prefix="lm_head",
+            )
 
     return Model(
         emb,
@@ -466,22 +538,25 @@ def convert(
     batch_size,
     headdim,
     model_config,
+    shift,
+    return_hidden=False,
 ):
     dtype = mil.input_types.types.fp16
     if channels_first:
         if apply_initial_embedding:
             shape = (batch_size, seqlen)
         else:
-            shape = (batch_size, 896, seqlen)
+            shape = (batch_size, model_config.hidden_size, seqlen)
     else:
         if apply_initial_embedding:
             shape = (batch_size, seqlen)
         else:
-            shape = (batch_size, seqlen, 896)
+            shape = (batch_size, seqlen, model_config.hidden_size)
     state_spec = state_spec = [
         mb.StateTensorSpec(
             (
-                model_config.num_hidden_layers * batch_size,
+                # model_config.num_hidden_layers * batch_size,
+                num_blocks * batch_size,
                 model_config.num_key_value_heads,
                 cache_len,
                 headdim,
@@ -490,7 +565,8 @@ def convert(
         ),
         mb.StateTensorSpec(
             (
-                model_config.num_hidden_layers * batch_size,
+                # model_config.num_hidden_layers * batch_size,
+                num_blocks * batch_size,
                 model_config.num_key_value_heads,
                 cache_len,
                 headdim,
@@ -513,6 +589,16 @@ def convert(
                 (1,),
                 dtype=mil.input_types.types.int32,
             ),  # query_pos
+            mb.TensorSpec(
+                # (batch_size,), dtype=mil.input_types.types.int32
+                (seqlen,),
+                dtype=mil.input_types.types.int32,
+            ),  # query_pos
+            mb.TensorSpec(
+                # (batch_size,), dtype=mil.input_types.types.int32
+                (batch_size, 1, seqlen, cache_len),
+                dtype=mil.input_types.types.fp16,
+            ),  # mask
             # mb.TensorSpec(
             #     (1,), dtype=mil.input_types.types.int32
             #     # (batch_size,), dtype=mil.input_types.types.int32
@@ -525,6 +611,8 @@ def convert(
     def program(
         input_ids,
         query_pos1,
+        indices,
+        mask,
         # query_pos2,
         key_cache_state,
         value_cache_state,
@@ -533,11 +621,15 @@ def convert(
             input_ids,
             # [query_pos1, query_pos2],
             [query_pos1],
+            indices=indices,
             states=[key_cache_state, value_cache_state],
             apply_initial_embedding=apply_initial_embedding,
             apply_lm_head=apply_lm_head,
             return_mask_and_pos_emb=False,
             num_blocks=num_blocks,
+            shift=shift,
+            return_hidden=return_hidden,
+            mask=mask,
         )
 
     print(program)
@@ -560,6 +652,7 @@ def convert(
         #     ct.TensorType(name="query_pos", shape=(1,)),
         # ],
         pass_pipeline=pipeline,
+        skip_model_load=True,
     )
 
     print("aaah")
@@ -579,9 +672,10 @@ def convert(
         print(e)
 
 
-def make_embedding_model(mil_model: Model, save_path):
+def make_embedding_model(mil_model: Model, save_path, channels_first):
     shapes = [
-        (1, seqlen) for seqlen in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)
+        (1, seqlen)
+        for seqlen in (40, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)
     ]
     enum_shape = mil.input_types.EnumeratedShapes(shapes=shapes)
 
@@ -592,7 +686,7 @@ def make_embedding_model(mil_model: Model, save_path):
         opset_version=mil.builder.AvailableTarget.iOS18,
     )
     def program(input_ids):
-        return mil_model.embedding(input_ids, channels_first=False)
+        return mil_model.embedding(input_ids, channels_first=channels_first)
 
     print(program)
 
@@ -600,14 +694,89 @@ def make_embedding_model(mil_model: Model, save_path):
     pipeline.remove_passes({"common::add_int16_cast"})
     cml_converted = ct.convert(
         program,
-        # compute_units=ct.ComputeUnit.CPU_AND_NE,
-        compute_units=ct.ComputeUnit.ALL,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        # compute_units=ct.ComputeUnit.ALL,
         compute_precision=ct.precision.FLOAT16,
         # compute_precision=compute_precision,
         # minimum_deployment_target=ct.target.iOS17,
         minimum_deployment_target=ct.target.iOS18,
         inputs=[
-            ct.TensorType(name="input_ids", shape=ct.EnumeratedShapes(shapes)),
+            ct.TensorType(
+                name="input_ids",
+                shape=ct.EnumeratedShapes(shapes),
+                # default_value=(1, 40),
+            ),
+        ],
+        pass_pipeline=pipeline,
+    )
+
+    if os.path.exists(save_path):
+        shutil.rmtree(save_path)
+    try:
+        cml_converted.save(save_path)
+    except Exception as e:
+        print(e)
+        cml_converted.save(f"F_{save_path}")
+
+    try:
+        print(cml_converted._get_mil_internal())
+    except Exception as e:
+        print(e)
+
+
+def make_lm_head(
+    mil_model: Model,
+    save_path,
+    config,
+    channels_first=True,
+    return_hidden=False,
+    return_logsumexp=True,
+):
+    if channels_first:
+        shapes = [
+            (1, config.hidden_size, seqlen)
+            for seqlen in (40, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)
+        ]
+    else:
+        shapes = [
+            (1, seqlen, config.hidden_size)
+            for seqlen in (40, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048)
+        ]
+    enum_shape = mil.input_types.EnumeratedShapes(shapes=shapes)
+
+    @mb.program(
+        input_specs=[
+            mb.TensorSpec(enum_shape.symbolic_shape, dtype=mil.input_types.types.fp16)
+        ],
+        opset_version=mil.builder.AvailableTarget.iOS18,
+    )
+    def program(hidden_states):
+        if channels_first:
+            axis = 1
+        else:
+            axis = 2
+        # hidden_states = mil_model.finalnorm(
+        #     hidden_states, axes=[axis], prefix="final_norm"
+        # ) # moved to inside the model
+        logits = mil_model.head(hidden_states, return_logsumexp=return_logsumexp)
+        if return_hidden:
+            return *logits, hidden_states
+        return logits
+
+    print(program)
+
+    pipeline = ct.PassPipeline.DEFAULT
+    pipeline.remove_passes({"common::add_int16_cast"})
+    cml_converted = ct.convert(
+        program,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        # compute_units=ct.ComputeUnit.ALL,
+        compute_precision=ct.precision.FLOAT16,
+        # compute_precision=compute_precision,
+        # minimum_deployment_target=ct.target.iOS17,
+        minimum_deployment_target=ct.target.iOS18,
+        inputs=[
+            ct.TensorType(name="hidden_states", shape=ct.EnumeratedShapes(shapes)),
         ],
         pass_pipeline=pipeline,
     )
@@ -627,18 +796,28 @@ def make_embedding_model(mil_model: Model, save_path):
 
 
 if __name__ == "__main__":
-    model_name = "Qwen/Qwen2-1.5B"
+    # model_name = "Qwen/Qwen2-1.5B"
+    # model_name = "daryl149/llama-2-7b-chat-hf"
+    model_name = "meta-llama/Llama-3.2-1B-Instruct"
+
     from argparse import ArgumentParser
 
     parser = ArgumentParser(description="Quantize tensors from a safetensors file.")
-    parser.add_argument("--gs", required=True, type=int)
+    parser.add_argument("--gs", default=-1, type=int)
     parser.add_argument("--headdim", required=True, type=int)
     parser.add_argument("--qseqlen", required=True, type=int)
+    parser.add_argument("--make-lm-head", default=False, action="store_true")
+    parser.add_argument("--make-embedding", default=False, action="store_true")
+    parser.add_argument("--apply-emb", default=False, action="store_true")
+    parser.add_argument("--use-original-emb", default=False, action="store_true")
     parser.add_argument(
         "--bits", type=int, required=True, help="Number of bits for quantization"
     )
+    parser.add_argument("--nblocks", type=int, default=-1, help="")
     parser.add_argument(
-        "--nblocks", type=int, required=True, help="Number of bits for quantization"
+        "--shift",
+        type=int,
+        default=0,
     )
 
     args = parser.parse_args()
@@ -649,8 +828,11 @@ if __name__ == "__main__":
     # tensors_path = "/Users/sebastianamenabar/.cache/huggingface/hub/models--Qwen--Qwen2-0.5B-Instruct/snapshots/c540970f9e29518b1d8f06ab8b24cba66ad77b6d/model.safetensors"
     # tensors_path = "/Users/sebastianamenabar/.cache/huggingface/hub/models--Qwen--Qwen2-1.5B/snapshots/8a16abf2848eda07cc5253dec660bf1ce007ad7a/model.safetensors"
     # nbits = 8
-    tensors_path = "/Users/sebastianamenabar/Documents/mydeving/coreml-models/safetensors/Qwen2-1.5B-{}B-GS{}.safetensors"
-    model_config: Qwen2Config = AutoConfig.from_pretrained(model_name)
+    # tensors_path = "/Users/sebastianamenabar/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6/model.safetensors"
+    tensors_path = "/Users/sebastianamenabar/Documents/mydeving/coreml-models/safetensors/Llama-3.2-1B-Instruct-LUT-4bit-GS4.safetensors"
+    # tensors_path = "/Users/sebastianamenabar/Documents/mydeving/coreml-models/safetensors/Qwen2-1.5B-{}B-GS{}.safetensors"
+    # tensors_path = "/Users/sebastianamenabar/Documents/mydeving/coreml-models/safetensors/llama_2_7b_chat_palletized_4_bit.safetensors"
+    model_config = AutoConfig.from_pretrained(model_name, token=os.environ["HF_TOKEN"])
     print(model_config)
     print("Reading tensors")
     tensors = safe_open(tensors_path.format(nbits, gs), framework="numpy")
@@ -658,8 +840,10 @@ if __name__ == "__main__":
     batch_size = 1
     qseqlen = args.qseqlen
     cache_len = 512
-    quantized_emb = False
+    quantized_emb = True
+    quantized_head = True
     split_head = True
+    shared_emb_lm_head = True
     mil_model = convert_to_mil(
         tensors,
         channels_first,
@@ -670,20 +854,26 @@ if __name__ == "__main__":
         split_head=split_head,
         nbits=nbits,
         batch_size=batch_size,
+        shared_emb_lm_head=shared_emb_lm_head,
+        quantized_lm_head=quantized_head,
         unquantized_layers=(
-            [0, model_config.num_hidden_layers - 1]
+            # [0, model_config.num_hidden_layers - 1]
+            []
             if nbits != 16
             else [i for i in range(model_config.num_hidden_layers)]
         ),
         # unquantized_layers=[i for i in range(model_config.num_hidden_layers)]
+        use_original_emb=args.use_original_emb,
     )
     num_blocks = args.nblocks
     if num_blocks == -1:
-        num_blocks = model_config.num_hidden_layers
-    apply_lm_head = True
-    apply_initial_embedding = True
+        num_blocks = model_config.num_hidden_layers - args.shift
+    apply_lm_head = False
+    apply_initial_embedding = args.apply_emb
     # filename = f"QWEN-1.5B-{nbits}B-GS{gs}-LUT-SCALE-{qseqlen}-QL{'-NO-EMB' if apply_lm_head is False else ''}-{num_blocks}-BLOCKS-C{'F' if channels_first else 'L'}.mlpackage"
-    filename = f"QWEN-1.5B-{nbits}B-{qseqlen}-QL{'-NO-EMB' if apply_lm_head is False else ''}-{num_blocks}-BLOCKS-C{'F' if channels_first else 'L'}.mlpackage"
+    # filename = f"QWEN-1.5B-{nbits}B-{qseqlen}-QL{'-NO-EMB' if apply_lm_head is False else ''}-{num_blocks}-BLOCKS-C{'F' if channels_first else 'L'}.mlpackage"
+    # filename = f"Llama-2-7b-chat-4bit-chunk-1-{qseqlen}.mlpackage"
+    filename = f"Llama-3.2-1B-{nbits}bits-CTX-{qseqlen}.mlpackage"
     convert(
         mil_model,
         qseqlen,
@@ -696,7 +886,21 @@ if __name__ == "__main__":
         batch_size,
         headdim=args.headdim,
         model_config=model_config,
+        shift=args.shift,
+        # return_hidden=return_hidden,
         # unquantized_blocks=[0, num_blocks - 1],
     )
 
-    # make_embedding_model(mil_model, "QWEN-05B-I-EMB.mlpackage")
+    if args.make_embedding:
+        make_embedding_model(mil_model, f"Llama-3.2-1B-EMB-16Bits.mlpackage", channels_first)
+        # make_embedding_model(mil_model, f"llama-2-7b-chat-4bit-emb.mlpackage", channels_first)
+    if args.make_lm_head:
+        make_lm_head(
+            mil_model,
+            # f"llama-2-7b-chat-6bit-head",
+            f"Llama-3.2-1B-HEAD-16Bits.mlpackage",
+            model_config,
+            channels_first,
+            return_hidden=False,
+            return_logsumexp=True,
+        )
