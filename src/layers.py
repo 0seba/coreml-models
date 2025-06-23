@@ -10,7 +10,7 @@ from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
 from coremltools.converters.mil.mil.ops.defs.iOS17 import _IOS17_TARGET
 from custom_conv import conv
 
-register_op(conv, opset_version=_IOS17_TARGET, allow_override=True)  #
+# register_op(conv, opset_version=_IOS17_TARGET, allow_override=True)  #
 
 
 class NamedCall:
@@ -171,7 +171,7 @@ class LUTLinear(NamedCall):
         name: None | str = None,
     ):
         super().__init__(name)
-        bits = int(np.log2(lut.shape[-2]))
+        # bits = int(np.log2(lut.shape[-2]))
         assert 2**bits == lut.shape[-2]
         if bits == 1:
             self.w = np.array(w).astype(mil.mil.types.np_uint1_dtype)
@@ -194,16 +194,18 @@ class LUTLinear(NamedCall):
         else:
             self.op = mb.linear
 
-    def __call__(self, x, name=None):
+    def __call__(self, x, name=None, vector_axis=None):
         w = mb.constexpr_lut_to_dense(
             indices=self.w,
             lut=self.lut,
-            name=self.name(name) + "_weight_dequantization",
+            name=self.name(name) + "lut_dequantization",
+            vector_axis=vector_axis,
         )
         if self.s is not None:
             w = mb.constexpr_blockwise_shift_scale(
                 data=w,
                 scale=self.s,
+                name=self.name(name) + "weight_shift_scale",
             )
         if self.b is not None:
             x = self.op(x=x, weight=w, bias=self.b, name=self.name(name))
@@ -365,14 +367,14 @@ class RMSNorm(NamedCall):
         eps = np.array(eps, dtype=dtype)
         beta = np.array(np.inf, dtype=dtype)
         # dimroot = np.array(dimroot, dtype=dtype)
-        maxval = mb.abs(x=x, name=f"{prefix}_rmsnorm_abs")
+        maxval = mb.abs(x=x, name=f"{prefix}rmsnorm_abs")
         maxval = mb.reduce_max(
-            x=maxval, axes=axes, keep_dims=True, name=f"{prefix}_rmsnorm_maxval"
+            x=maxval, axes=axes, keep_dims=True, name=f"{prefix}rmsnorm_maxval"
         )
         maxval = mb.clip(
-            x=maxval, alpha=eps, beta=beta, name=f"{prefix}_rmsnorm_maxval_clipped"
+            x=maxval, alpha=eps, beta=beta, name=f"{prefix}rmsnorm_maxval_clipped"
         )
-        xscaled = mb.real_div(x=x, y=maxval, name=f"{prefix}_rmsnorm_scaled")
+        xscaled = mb.real_div(x=x, y=maxval, name=f"{prefix}rmsnorm_scaled")
 
         # norm = mb.reduce_l2_norm(
         #     x=x, axes=axes, keep_dims=True, name=f"{prefix}_rmsnorm_norm"
@@ -384,21 +386,21 @@ class RMSNorm(NamedCall):
 
         # Seems like reduce_l2_norm does not work on ANE, so we split in separate ops
         sq_sum = mb.reduce_sum_square(
-            x=xscaled, axes=axes, keep_dims=True, name=f"{prefix}_rmsnorm_squared_sum"
+            x=xscaled, axes=axes, keep_dims=True, name=f"{prefix}rmsnorm_squared_sum"
         )
-        rsqrt = mb.rsqrt(x=sq_sum, epsilon=eps, name=f"{prefix}_rmsnorm_rsqrt")
+        rsqrt = mb.rsqrt(x=sq_sum, epsilon=eps, name=f"{prefix}rmsnorm_rsqrt")
         xscaled = mb.mul(
-            x=xscaled, y=dimroot.astype(dtype), name=f"{prefix}_rmsnorm_dim_scaled"
+            x=xscaled, y=dimroot.astype(dtype), name=f"{prefix}rmsnorm_dim_scaled"
         )
         # xscaled = mb.mul(x=x, y=dimroot.astype(dtype), name=f"{prefix}_rmsnorm_dim_scaled")
         # xnormed = mb.real_div(x=xscaled, y=norm, name=f"{prefix}_rmsnorm_normalized")
-        xnormed = mb.mul(x=xscaled, y=rsqrt, name=f"{prefix}_rmsnorm_normalized")
+        xnormed = mb.mul(x=xscaled, y=rsqrt, name=f"{prefix}rmsnorm_normalized")
         return xnormed
 
     @staticmethod
     def normalize(x, eps, dimroot, prefix, axes):
         squared = mb.reduce_sum_square(
-            x=x, axes=axes, keep_dims=True, name=f"{prefix}_rmsnorm_squared_sum"
+            x=x, axes=axes, keep_dims=True, name=f"{prefix}rmsnorm_squared_sum"
         )
         # squared_mean = mb.real_div(
         #     x=squared,
@@ -406,12 +408,12 @@ class RMSNorm(NamedCall):
         #     name=f"{prefix}_rmsnorm_squared_mean",
         # )
         norm_reciprocal = mb.rsqrt(
-            x=squared, epsilon=eps, name=f"{prefix}_rmsnorm_norm_reciprocal"
+            x=squared, epsilon=eps, name=f"{prefix}rmsnorm_norm_reciprocal"
         )
         rmsnorm_reciprocal = mb.mul(
-            x=norm_reciprocal, y=dimroot, name=f"{prefix}_rmsnorm_rmsnorm_reciprocal"
+            x=norm_reciprocal, y=dimroot, name=f"{prefix}rmsnorm_rmsnorm_reciprocal"
         )
-        return mb.mul(x=x, y=rmsnorm_reciprocal, name=f"{prefix}_rmsnorm_normalized")
+        return mb.mul(x=x, y=rmsnorm_reciprocal, name=f"{prefix}rmsnorm_normalized")
 
     def __call__(self, x, prefix=None, w=None, axes=None, squeeze=False):
         if axes is None:
@@ -430,7 +432,7 @@ class RMSNorm(NamedCall):
         if w is not None:
             if squeeze:  # Quick fix
                 w = w.squeeze()
-            return mb.mul(x=xnormed, y=w, name=f"{prefix}_rmsnorm")
+            return mb.mul(x=xnormed, y=w, name=f"{prefix}rmsnorm")
         return xnormed
 
 

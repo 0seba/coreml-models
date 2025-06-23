@@ -15,7 +15,7 @@ from transformers import AutoConfig
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from ml_dtypes import bfloat16
 
-from models.llama import (
+from models._llama import (
     Block,
     Model,
     Attention,
