@@ -4,6 +4,7 @@ import math
 import numpy as np
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil import Builder as mb
+from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
 
 def gather_static(indices, target, prefix, transpose=False):
@@ -49,12 +50,23 @@ def apply_rotary_pos_emb(hidden_states, sin_emb, cos_emb, axis: int, prefix: str
 def update_cache(
     update,
     cache,
+    state,
     cache_write_start,
     cache_write_end,
     kv_layer_write_idx,
     prefix,
     channels_last: bool = True,
 ):
+    # seqlen_idx = 2 if channels_last else 3
+    # seqlen = update.shape[seqlen_idx]
+    # if is_symbolic(seqlen):
+    #     shape = mb.shape(x=update, name=f"{prefix}input_shape")
+    #     seqlen = mb.gather(
+    #         x=shape, indices=seqlen_idx, name=f"{prefix}sequence_length"
+    #     )
+    # cache_write_end = mb.add(
+    #     x=cache_write_start, y=seqlen, name=f"{prefix}kv_write_idx_end"
+    # )
     if channels_last:
         begin = mb.concat(
             values=(
@@ -108,6 +120,7 @@ def update_cache(
         end_mask=[False] * 4,
         squeeze_mask=[False] * 4,
     )
+    cache = mb.coreml_update_state(state=state, value=cache, name=prefix + "update_state")
     return cache
 
 
@@ -228,7 +241,6 @@ def gqa_attention(
     num_kv_heads = key.shape[1]
     assert (num_q_heads % num_kv_heads) == 0
     group_size = num_q_heads // num_kv_heads
-    print(query.shape)
     qs = mb.split(x=query, axis=1, num_splits=num_kv_heads, name=prefix + "query_split")
     ks = mb.split(x=key, axis=1, num_splits=num_kv_heads, name=prefix + "key_split")
     vs = mb.split(x=value, axis=1, num_splits=num_kv_heads, name=prefix + "value_split")
@@ -280,13 +292,12 @@ def gqa_attention(
                 name=prefix + f"group_{i}_output",
                 transpose_x=True,
             )  # (batch, heads, headdim, source_seqlen)
-            print(output.shape)
             output = mb.reshape(
                 x=output,
-                shape=[batch_size, group_size * headdim, 1, seqlen],
+                # shape=[batch_size, group_size * headdim, 1, seqlen],
+                shape=[batch_size, group_size * headdim, 1, -1],
                 name=prefix + f"group_{i}_output_reshaped",
             )
-            print(output.shape)
         else:
             raise NotImplementedError()
         per_head_attention.append(output)

@@ -4,16 +4,20 @@ from typing import Dict, Any
 from argparse import ArgumentParser
 
 import numpy as np
+import torch
 from torch import Tensor
 from safetensors.torch import load_file  # use torch safetensors to load bfloat16
 
 import coremltools as ct
 import coremltools.converters.mil as mil
 from coremltools.converters.mil import Builder as mb
+from coremltools.converters.mil.mil import get_new_symbol
+from coremltools.converters.mil.mil.passes.pass_pipeline import PassPipelineManager
 
 from layers import LUTLinear
 from positional_encodings import compute_default_rope_parameters, compute_rope_embedding
 from utils.quantization import unpack_weights
+from utils.coreml_utils import print_compute_plan_sync
 from .falcon_edge_bitnet import (
     FalconEdgeRMSNorm,
     FalconEdgeAttentionLayer,
@@ -21,6 +25,13 @@ from .falcon_edge_bitnet import (
     FalconEdgeMLP,
     FalconEdgeBitnetModel,
 )
+from sampling.min_p import min_p
+
+from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
+from coremltools.converters.mil.mil.ops.defs.iOS17 import _IOS17_TARGET
+from custom_conv import conv
+
+register_op(conv, opset_version=_IOS17_TARGET, allow_override=True)
 
 
 Tensors = Dict[str, Tensor]
@@ -48,7 +59,6 @@ def convert_linear(tensors: Tensors, prefix: str, use_quantized_lut=False):
         .astype(np.float16)
         .squeeze()
     )
-    print(scale)
 
     if use_quantized_lut:
         s = scale
@@ -88,15 +98,14 @@ def convert_mlp(tensors: Tensors, prefix: str):
 
 
 def build_model_from_safetensors(
-    model_path: str, layer_from: int, layer_to: int, max_sequence_length: int = 2048
+    tensors: Tensors,
+    config: Dict[str, Any],
+    layer_from: int = 0,
+    layer_to: int = -1,
+    max_sequence_length: int = 2048,
 ):
-    config_path = os.path.join(model_path, "config.json")
-    with open(config_path, "r") as f:
-        config = json.load(f)
-    print(config)
-    tensors_path = os.path.join(model_path, "model.safetensors")
-    tensors = load_file(tensors_path)
-
+    if layer_to == -1:
+        layer_to = config["num_hidden_layers"]
     decoder_layers = []
     for i in range(layer_from, layer_to):
         input_layernorm = convert_rmsnorm(
@@ -134,10 +143,15 @@ def build_model_from_safetensors(
     return model, config
 
 
-def convert(model: FalconEdgeBitnetModel, config: Dict[str, Any]):
-    batch_size = 1
-    seqlen = 8
-    cache_len = 1024
+def convert(
+    model: FalconEdgeBitnetModel,
+    config: Dict[str, Any],
+    batch_size=1,
+    seq_len=32,
+    cache_len=1024,
+    package_dir=None,
+    skip_model_load=False,
+):
     headdim = config["head_dim"]
     num_hidden_layers = config["num_hidden_layers"]
     hidden_size = config["hidden_size"]
@@ -163,10 +177,21 @@ def convert(model: FalconEdgeBitnetModel, config: Dict[str, Any]):
         ),
     ]
 
+    lengths = [1, 8, 32, 64, 128, 256]
+    hidden_states_input_shapes = [
+        (batch_size, hidden_size, 1, seq_len) for seq_len in lengths
+    ]
+    positions_input_shapes = [(batch_size, seq_len) for seq_len in lengths]
+    length_sym = get_new_symbol()
+
     @mb.program(
         input_specs=[
             mb.TensorSpec(
-                (batch_size, hidden_size, 1, seqlen),
+                # mil.input_types.EnumeratedShapes(
+                #     shapes=hidden_states_input_shapes
+                # ).symbolic_shape,
+                (batch_size, hidden_size, 1, length_sym),
+                # (batch_size, hidden_size, 1, seq_len),
                 dtype=mil.input_types.types.fp16,
             ),
             mb.TensorSpec(
@@ -174,29 +199,114 @@ def convert(model: FalconEdgeBitnetModel, config: Dict[str, Any]):
                 dtype=mil.input_types.types.int32,
             ),
             mb.TensorSpec(
-                (
-                    batch_size,
-                    seqlen,
-                ),
+                (batch_size, length_sym),
+                # (batch_size, seq_len),
                 dtype=mil.input_types.types.int32,
             ),
             *state_spec,
         ],
         opset_version=mil.builder.AvailableTarget.iOS18,
+        # function_name="model_flex",
     )
     def program(hidden_states, kv_write_idx, positions, key_cache, value_cache):
         return model(hidden_states, kv_write_idx, positions, key_cache, value_cache)
 
     print(program)
 
+    pipeline = ct.PassPipeline.DEFAULT
+    pipeline.insert_pass(0, "common::materialize_symbolic_shape_program")
+    pipeline.set_options(
+        "common::materialize_symbolic_shape_program",
+        {
+            "function_name_to_materialization_map": {
+                # As an example, let us assume the input is x (is0, is1, 1024)
+                f"model_length_{l}": {
+                    "hidden_states": (batch_size, hidden_size, 1, l),
+                    "kv_write_idx": (batch_size,),
+                    "positions": (batch_size, l),
+                }
+                for l in lengths
+            }
+        },
+    )
+
+    PassPipelineManager.apply_pipeline(program, pipeline)
+    program.export_as_multifunction = True
+    program.skip_all_passes = True
+
     mlmodel = ct.convert(
         program,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS18,
-        skip_model_load=False,
+        skip_model_load=skip_model_load,
+        inputs=[
+            ct.TensorType(
+                shape=ct.EnumeratedShapes(hidden_states_input_shapes),
+                name="hidden_states",
+            ),
+            ct.TensorType(shape=(1,), name="kv_write_idx"),
+            ct.TensorType(
+                shape=ct.EnumeratedShapes(positions_input_shapes), name="positions"
+            ),
+        ],
+        # pass_pipeline=pipeline,
+        package_dir=package_dir,
     )
 
+    return mlmodel
+
+
+def convert_lm_head(
+    tensors: Tensors, chunk_size=16_384, batch_size=1, hidden_size=2048
+):
+    final_rms_norm = convert_rmsnorm(tensors, "model.norm")
+    ws = (
+        tensors["lm_head.weight"]
+        .unsqueeze(-1)
+        .unsqueeze(-1)
+        .float()
+        .half()
+        .split(chunk_size, dim=0)
+    )
+    ws = [w.numpy() for w in ws]
+
+    @mb.program(
+        input_specs=[
+            mb.TensorSpec(
+                (batch_size, hidden_size, 1, 1),
+                dtype=mil.input_types.types.fp16,
+            ),
+            mb.TensorSpec(
+                (1,),
+                dtype=mil.input_types.types.fp16,
+            ),
+            mb.TensorSpec(
+                (1,),
+                dtype=mil.input_types.types.fp16,
+            ),
+            mb.TensorSpec(
+                (1,),
+                dtype=mil.input_types.types.fp32,
+            ),
+        ],
+        opset_version=mil.builder.AvailableTarget.iOS18,
+    )
+    def lm_head(hidden_states, p, temp, random_number):
+        hidden_states = final_rms_norm(hidden_states, "final_norm_")
+        return min_p(hidden_states, ws, p, temp, random_number)
+
+    pipeline = ct.PassPipeline.DEFAULT
+    pipeline.remove_passes({"common::add_int16_cast"})
+    pipeline.remove_passes({"common::add_fp16_cast"})
+    mlmodel = ct.convert(
+        lm_head,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.iOS18,
+        skip_model_load=False,
+        pass_pipeline=pipeline,
+    )
     return mlmodel
 
 
@@ -210,30 +320,54 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    model, config = build_model_from_safetensors(
-        args.model_path, 0, 1, max_sequence_length=2048
-    )
-    mlmodel = convert(model, config)
-    # mlmodel.save("falcon_edge_bitnet.mlmodel")
-    import torch
-    from transformers import AutoModel
-    from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaDecoderLayer
+    config_path = os.path.join(args.model_path, "config.json")
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    tensors_path = os.path.join(args.model_path, "model.safetensors")
+    tensors = load_file(tensors_path)
 
-    model: LlamaForCausalLM = AutoModel.from_pretrained("tiiuae/Falcon-E-1B-Instruct")
+    # mlmodel = convert_lm_head(tensors)
+    # mlmodel.save("falcon-bitnet-lmhead")
+
+    model, config = build_model_from_safetensors(
+        tensors, config, 0, -1, max_sequence_length=2048
+    )
+    mlmodel = convert(model, config, package_dir="falcon_edge_bitnet.mlpackage", cache_len=1024)
+    # print(mlmodel._get_mil_internal())
+    print_compute_plan_sync(
+        mlmodel.get_compiled_model_path(), compute_unit=ct.ComputeUnit.CPU_AND_NE
+    )
+    # mlmodel.save("falcon_edge_bitnet")
+    # import torch
+    # from transformers import AutoModel
+    # from transformers.models.llama.modeling_llama import (
+    #     LlamaForCausalLM,
+    #     LlamaDecoderLayer,
+    # )
+
+    # model: LlamaForCausalLM = AutoModel.from_pretrained("tiiuae/Falcon-E-1B-Instruct")
     hidden_states = torch.randn(1, 8, 2048).half()
     hidden_states_np = hidden_states.transpose(-1, -2).unsqueeze(-2).numpy()
 
-    torch_causal_mask = torch.arange(8)[:, None] <= torch.arange(8)[None, :]
-    torch_causal_mask = torch_causal_mask[None, None, :, :]
-    torch_layer: LlamaDecoderLayer = model.layers[0]
-    position_embeddings = model.rotary_emb(hidden_states, torch.arange(8).unsqueeze(0))
-    torch_pred = torch_layer(hidden_states, torch_causal_mask, torch.arange(8).unsqueeze(0), position_embeddings=position_embeddings)
-    print(torch_pred)
+    # torch_causal_mask = torch.arange(8)[:, None] <= torch.arange(8)[None, :]
+    # torch_causal_mask = torch_causal_mask[None, None, :, :]
+    # torch_layer: LlamaDecoderLayer = model.layers[0]
+    # position_embeddings = model.rotary_emb(hidden_states, torch.arange(8).unsqueeze(0))
+    # torch_pred = torch_layer(
+    #     hidden_states,
+    #     torch_causal_mask,
+    #     torch.arange(8).unsqueeze(0),
+    #     position_embeddings=position_embeddings,
+    # )
+    # print(torch_pred)
 
     state = mlmodel.make_state()
-    coreml_pred = mlmodel.predict({
-        "hidden_states": hidden_states_np,
-        "kv_write_idx": np.array([0], dtype=np.int32),
-        "positions": np.arange(8, dtype=np.int32)[None, :],
-    }, state=state)
+    coreml_pred = mlmodel.predict(
+        {
+            "hidden_states": hidden_states_np,
+            "kv_write_idx": np.array([0], dtype=np.int32),
+            "positions": np.arange(8, dtype=np.int32)[None, :],
+        },
+        state=state,
+    )
     print(coreml_pred)

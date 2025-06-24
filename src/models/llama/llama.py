@@ -1,11 +1,10 @@
 from typing import List, Optional
 from dataclasses import dataclass
 
-
 import math
 import numpy as np
 from coremltools.converters.mil import Builder as mb
-
+from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
 from layers import LUTLinear, RMSNorm
 from ops import (
@@ -30,6 +29,8 @@ class AttentionArgs:
     kv_cache_write_idx_end: any
     key_cache: any
     value_cache: any
+    key_state: any
+    value_state: any
 
 
 class LlamaAttentionLayer:
@@ -60,7 +61,6 @@ class LlamaAttentionLayer:
         cache_seqlen = attention_args.key_cache.shape[-2]
 
         q = self.q_proj(hidden_states, name=prefix + "q_proj_")
-        print(q.shape)
         headdim = q.shape[1] // self.num_query_heads
         q = mb.reshape(
             x=q,
@@ -68,17 +68,19 @@ class LlamaAttentionLayer:
                 batch_size,
                 self.num_query_heads,
                 headdim,
-                seqlen,
+                # seqlen,
+                -1,
             ],
             name=f"{prefix}q_reshape",
         )
-        print(q.shape)
         q = mb.transpose(x=q, perm=[0, 1, 3, 2], name=f"{prefix}q_transpose")
-        print(q.shape)
         q = apply_rotary_pos_emb(
-            q, attention_args.sin_emb, attention_args.cos_emb, axis=3, prefix=prefix
+            q,
+            attention_args.sin_emb,
+            attention_args.cos_emb,
+            axis=3,
+            prefix=prefix + "query_",
         )
-        print(q.shape)
 
         k = self.k_proj(hidden_states, name=prefix + "k_proj_")
         k = mb.reshape(
@@ -87,17 +89,23 @@ class LlamaAttentionLayer:
                 batch_size,
                 self.num_kv_heads,
                 headdim,
-                seqlen,
+                # seqlen,
+                -1,
             ],
             name=f"{prefix}k_reshape",
         )
         k = mb.transpose(x=k, perm=[0, 1, 3, 2], name=f"{prefix}k_transpose")
         k = apply_rotary_pos_emb(
-            k, attention_args.sin_emb, attention_args.cos_emb, axis=3, prefix=prefix
+            k,
+            attention_args.sin_emb,
+            attention_args.cos_emb,
+            axis=3,
+            prefix=prefix + "key_",
         )
         k = update_cache(
             k,
             attention_args.key_cache,
+            attention_args.key_state,
             attention_args.kv_cache_write_idx_begin,
             attention_args.kv_cache_write_idx_end,
             kv_cache_layer_write_idx,
@@ -123,7 +131,8 @@ class LlamaAttentionLayer:
                 batch_size,
                 self.num_kv_heads,
                 headdim,
-                seqlen,
+                # seqlen,
+                -1,
             ],
             name=f"{prefix}v_reshape",
         )
@@ -131,6 +140,7 @@ class LlamaAttentionLayer:
         v = update_cache(
             v,
             attention_args.value_cache,
+            attention_args.value_state,
             attention_args.kv_cache_write_idx_begin,
             attention_args.kv_cache_write_idx_end,
             kv_cache_layer_write_idx,
@@ -160,7 +170,6 @@ class LlamaAttentionLayer:
         attention = mb.concat(
             values=attention, axis=1, name=prefix + "attention_concat"
         )
-        print(attention.shape)
         output = self.o_proj(attention, name=prefix + "o_proj_")
 
         return output
@@ -256,8 +265,6 @@ class LlamaModel:
         cos_emb: Optional = None,
         # attention_args: AttentionArgs,
     ):
-        seqlen = hidden_states.shape[3]
-        kv_write_idx_end = mb.add(x=kv_write_idx, y=seqlen, name="kv_write_idx_end")
         if attention_mask is None:
             attention_mask = gather_static(
                 positions,
@@ -270,14 +277,23 @@ class LlamaModel:
         if cos_emb is None:
             cos_emb = gather_static(positions, self.cos_emb, "cos_emb_")
 
+        read_key_cache = mb.read_state(input=key_cache)
+        read_value_cache = mb.read_state(input=value_cache)
+        seqlen = hidden_states.shape[3]
+        if is_symbolic(seqlen):
+            shape = mb.shape(x=hidden_states, name="input_shape")
+            seqlen = mb.gather(x=shape, indices=3, name="sequence_length")
+        kv_write_idx_end = mb.add(x=kv_write_idx, y=seqlen, name="kv_write_idx_end")
         attention_args = AttentionArgs(
             attention_mask,
             sin_emb,
             cos_emb,
             kv_write_idx,
             kv_write_idx_end,
-            mb.read_state(input=key_cache),
-            mb.read_state(input=value_cache),
+            read_key_cache,
+            read_value_cache,
+            key_cache,
+            value_cache,
         )
 
         block: LlamaDecoderLayer
