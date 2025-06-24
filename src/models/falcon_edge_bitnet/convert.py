@@ -177,7 +177,8 @@ def convert(
         ),
     ]
 
-    lengths = [1, 8, 32, 64, 128, 256]
+    # lengths = [1, 8, 32, 64, 68, 72, 76, 80, 84,88, 92, 96, 128, 160]
+    lengths = [1, 8, 16, 32, 48, 64, 128]
     hidden_states_input_shapes = [
         (batch_size, hidden_size, 1, seq_len) for seq_len in lengths
     ]
@@ -270,11 +271,17 @@ def convert_lm_head(
         .split(chunk_size, dim=0)
     )
     ws = [w.numpy() for w in ws]
+    lengths = [1, 8, 16, 32, 48, 64, 128]
+    hidden_states_input_shapes = [
+        (batch_size, hidden_size, 1, seq_len) for seq_len in lengths
+    ]
+    positions_input_shapes = [(batch_size, seq_len) for seq_len in lengths]
+    length_sym = get_new_symbol()
 
     @mb.program(
         input_specs=[
             mb.TensorSpec(
-                (batch_size, hidden_size, 1, 1),
+                (batch_size, hidden_size, 1, length_sym),
                 dtype=mil.input_types.types.fp16,
             ),
             mb.TensorSpec(
@@ -286,7 +293,7 @@ def convert_lm_head(
                 dtype=mil.input_types.types.fp16,
             ),
             mb.TensorSpec(
-                (1,),
+                (length_sym,),
                 dtype=mil.input_types.types.fp32,
             ),
         ],
@@ -306,6 +313,24 @@ def convert_lm_head(
         minimum_deployment_target=ct.target.iOS18,
         skip_model_load=False,
         pass_pipeline=pipeline,
+        input=[
+            ct.TensorType(
+                shape=ct.EnumeratedShapes(hidden_states_input_shapes),
+                name="hidden_states",
+            ),
+            ct.TensorType(
+                shape=(1,),
+                name="p",
+            ),
+            ct.TensorType(
+                shape=(1,),
+                name="temp",
+            ),
+            ct.TensorType(
+                shape=ct.EnumeratedShapes((l,) for l in lengths),
+                name="random_number",
+            ),
+        ]
     )
     return mlmodel
 
@@ -330,9 +355,9 @@ if __name__ == "__main__":
     # mlmodel.save("falcon-bitnet-lmhead")
 
     model, config = build_model_from_safetensors(
-        tensors, config, 0, -1, max_sequence_length=2048
+        tensors, config, 0, 6, max_sequence_length=2048
     )
-    mlmodel = convert(model, config, package_dir="falcon_edge_bitnet.mlpackage", cache_len=1024)
+    mlmodel = convert(model, config, package_dir="falcon_edge_bitnet_6layers.mlpackage", cache_len=1024)
     # print(mlmodel._get_mil_internal())
     print_compute_plan_sync(
         mlmodel.get_compiled_model_path(), compute_unit=ct.ComputeUnit.CPU_AND_NE
