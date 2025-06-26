@@ -12,6 +12,7 @@ import coremltools as ct
 import coremltools.converters.mil as mil
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol
+from coremltools.models.utils import MultiFunctionDescriptor, save_multifunction
 from coremltools.converters.mil.mil.passes.pass_pipeline import PassPipelineManager
 
 from layers import LUTLinear
@@ -139,6 +140,7 @@ def build_model_from_safetensors(
         decoder_layers,
         sin_emb=sin_emb.astype(np.float16),
         cos_emb=cos_emb.astype(np.float16),
+        layer_from=layer_from,
     )
     return model, config
 
@@ -155,13 +157,14 @@ def convert(
     headdim = config["head_dim"]
     num_hidden_layers = config["num_hidden_layers"]
     hidden_size = config["hidden_size"]
+    cache_length_sym = get_new_symbol()
 
     state_spec = [
         mb.StateTensorSpec(
             (
                 num_hidden_layers * batch_size,
                 config["num_key_value_heads"],
-                cache_len,
+                cache_length_sym,
                 headdim,
             ),
             dtype=mil.input_types.types.fp16,
@@ -170,7 +173,7 @@ def convert(
             (
                 num_hidden_layers * batch_size,
                 config["num_key_value_heads"],
-                cache_len,
+                cache_length_sym,
                 headdim,
             ),
             dtype=mil.input_types.types.fp16,
@@ -196,23 +199,40 @@ def convert(
                 dtype=mil.input_types.types.fp16,
             ),
             mb.TensorSpec(
-                (1,),
-                dtype=mil.input_types.types.int32,
-            ),
-            mb.TensorSpec(
                 (batch_size, length_sym),
                 # (batch_size, seq_len),
                 dtype=mil.input_types.types.int32,
             ),
+            mb.TensorSpec(
+                (1,),
+                dtype=mil.input_types.types.int32,
+            ),
+            mb.TensorSpec(
+                (batch_size, 1, length_sym, cache_length_sym),
+                dtype=mil.input_types.types.fp16,
+            ),
             *state_spec,
         ],
         opset_version=mil.builder.AvailableTarget.iOS18,
-        # function_name="model_flex",
     )
-    def program(hidden_states, kv_write_idx, positions, key_cache, value_cache):
-        return model(hidden_states, kv_write_idx, positions, key_cache, value_cache)
-
-    print(program)
+    # def program(hidden_states, kv_write_idx, positions, key_cache, value_cache):
+    def program(
+        hidden_states,
+        positions,
+        kv_write_idx,
+        attention_mask,
+        key_cache,
+        value_cache,
+    ):
+        attention_mask = mb.transpose(x=attention_mask, perm=[0, 1, 3, 2], name="attention_mask_transposed")
+        return model(
+            hidden_states,
+            positions,
+            kv_write_idx,
+            attention_mask,
+            key_cache,
+            value_cache,
+        )
 
     pipeline = ct.PassPipeline.DEFAULT
     pipeline.insert_pass(0, "common::materialize_symbolic_shape_program")
@@ -221,12 +241,34 @@ def convert(
         {
             "function_name_to_materialization_map": {
                 # As an example, let us assume the input is x (is0, is1, 1024)
-                f"model_length_{l}": {
+                f"model_input_{l}_cache_{cache_length}": {
                     "hidden_states": (batch_size, hidden_size, 1, l),
                     "kv_write_idx": (batch_size,),
                     "positions": (batch_size, l),
+                    "attention_mask": (batch_size, 1, l, cache_length),
+                    "key_cache": (
+                        num_hidden_layers * batch_size,
+                        config["num_key_value_heads"],
+                        cache_length,
+                        headdim,
+                    ),
+                    "value_cache": (
+                        num_hidden_layers * batch_size,
+                        config["num_key_value_heads"],
+                        cache_length,
+                        headdim,
+                    ),
                 }
                 for l in lengths
+                for cache_length in [
+                    512,
+                    1024,
+                    2048,
+                    2048 + 1024,
+                    4096,
+                    4096 + 2048,
+                    8192,
+                ]
             }
         },
     )
@@ -234,6 +276,10 @@ def convert(
     PassPipelineManager.apply_pipeline(program, pipeline)
     program.export_as_multifunction = True
     program.skip_all_passes = True
+    # program.functions["flex"] = program.functions["main"]
+    program.functions["main"] = program.functions["model_input_1_cache_1024"]
+    # del program.functions["main"]
+    # program.default_function_name = "model_length_1"
 
     mlmodel = ct.convert(
         program,
@@ -241,16 +287,16 @@ def convert(
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS18,
         skip_model_load=skip_model_load,
-        inputs=[
-            ct.TensorType(
-                shape=ct.EnumeratedShapes(hidden_states_input_shapes),
-                name="hidden_states",
-            ),
-            ct.TensorType(shape=(1,), name="kv_write_idx"),
-            ct.TensorType(
-                shape=ct.EnumeratedShapes(positions_input_shapes), name="positions"
-            ),
-        ],
+        # inputs=[
+        #     ct.TensorType(
+        #         shape=ct.EnumeratedShapes(hidden_states_input_shapes),
+        #         name="hidden_states",
+        #     ),
+        #     ct.TensorType(shape=(1,), name="kv_write_idx"),
+        #     ct.TensorType(
+        #         shape=ct.EnumeratedShapes(positions_input_shapes), name="positions"
+        #     ),
+        # ],
         # pass_pipeline=pipeline,
         package_dir=package_dir,
     )
@@ -259,7 +305,11 @@ def convert(
 
 
 def convert_lm_head(
-    tensors: Tensors, chunk_size=16_384, batch_size=1, hidden_size=2048
+    tensors: Tensors,
+    chunk_size=16_384,
+    batch_size=1,
+    hidden_size=2048,
+    package_dir=None,
 ):
     final_rms_norm = convert_rmsnorm(tensors, "model.norm")
     ws = (
@@ -275,7 +325,6 @@ def convert_lm_head(
     hidden_states_input_shapes = [
         (batch_size, hidden_size, 1, seq_len) for seq_len in lengths
     ]
-    positions_input_shapes = [(batch_size, seq_len) for seq_len in lengths]
     length_sym = get_new_symbol()
 
     @mb.program(
@@ -298,22 +347,70 @@ def convert_lm_head(
             ),
         ],
         opset_version=mil.builder.AvailableTarget.iOS18,
+        # function_name="min_p",
     )
-    def lm_head(hidden_states, p, temp, random_number):
+    def min_p_program(hidden_states, p, temp, random_number):
         hidden_states = final_rms_norm(hidden_states, "final_norm_")
         return min_p(hidden_states, ws, p, temp, random_number)
 
+    @mb.program(
+        input_specs=[
+            mb.TensorSpec(
+                (batch_size, hidden_size, 1, length_sym),
+                dtype=mil.input_types.types.fp16,
+            ),
+        ],
+        opset_version=mil.builder.AvailableTarget.iOS18,
+        # function_name="lm_head",
+    )
+    def lm_head_program(hidden_states):
+        hidden_states = final_rms_norm(hidden_states, "final_norm_")
+        logits_list = []
+        for i, w in enumerate(ws):
+            logits_chunk = mb.conv(
+                x=hidden_states,
+                weight=w,
+                name=f"logits_chunk_{i}",
+            )
+            logits_list.append(logits_chunk)
+        logits = mb.concat(values=logits_list, axis=1, name="logits")
+        return logits
+
     pipeline = ct.PassPipeline.DEFAULT
+    pipeline.insert_pass(0, "common::materialize_symbolic_shape_program")
+    pipeline.set_options(
+        "common::materialize_symbolic_shape_program",
+        {
+            "function_name_to_materialization_map": {
+                # As an example, let us assume the input is x (is0, is1, 1024)
+                # f"main": {
+                f"min_p_length_{l}": {
+                    "hidden_states": (batch_size, hidden_size, 1, l),
+                    "p": (1,),
+                    "temp": (1,),
+                    "random_number": (l,),
+                }
+                for l in lengths
+            },
+            # "source_function_name": "min_p",
+        },
+    )
+
     pipeline.remove_passes({"common::add_int16_cast"})
     pipeline.remove_passes({"common::add_fp16_cast"})
-    mlmodel = ct.convert(
-        lm_head,
+    PassPipelineManager.apply_pipeline(min_p_program, pipeline)
+    min_p_program.export_as_multifunction = True
+    min_p_program.skip_all_passes = True
+
+    min_p_mlmodel = ct.convert(
+        min_p_program,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS18,
-        skip_model_load=False,
-        pass_pipeline=pipeline,
-        input=[
+        skip_model_load=True,
+        # pass_pipeline=pipeline,
+        # package_dir=package_dir,
+        inputs=[
             ct.TensorType(
                 shape=ct.EnumeratedShapes(hidden_states_input_shapes),
                 name="hidden_states",
@@ -327,19 +424,89 @@ def convert_lm_head(
                 name="temp",
             ),
             ct.TensorType(
-                shape=ct.EnumeratedShapes((l,) for l in lengths),
+                shape=ct.EnumeratedShapes([(l,) for l in lengths]),
                 name="random_number",
             ),
-        ]
+        ],
     )
-    return mlmodel
+
+    pipeline.insert_pass(0, "common::materialize_symbolic_shape_program")
+    pipeline.set_options(
+        "common::materialize_symbolic_shape_program",
+        {
+            "function_name_to_materialization_map": {
+                f"lm_head_length_{l}": {
+                    "hidden_states": (batch_size, hidden_size, 1, l),
+                }
+                for l in lengths
+            },
+        },
+    )
+
+    pipeline.remove_passes({"common::add_int16_cast"})
+    pipeline.remove_passes({"common::add_fp16_cast"})
+    PassPipelineManager.apply_pipeline(lm_head_program, pipeline)
+    lm_head_program.export_as_multifunction = True
+    lm_head_program.skip_all_passes = True
+
+    lm_head_mlmodel = ct.convert(
+        lm_head_program,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.iOS18,
+        skip_model_load=True,
+        # package_dir=package_dir,
+        inputs=[
+            ct.TensorType(
+                shape=ct.EnumeratedShapes(hidden_states_input_shapes),
+                name="hidden_states",
+            ),
+        ],
+    )
+
+    desc = MultiFunctionDescriptor()
+    desc.add_model(
+        model_path=min_p_mlmodel.package_path,
+    )
+    desc.remove_function("main")
+    desc.add_function(
+        model_path=min_p_mlmodel.package_path,
+        src_function_name="main",
+        target_function_name="min_p_flex",
+    )
+    desc.add_model(
+        model_path=lm_head_mlmodel.package_path,
+    )
+    desc.remove_function("main")
+    desc.add_function(
+        model_path=lm_head_mlmodel.package_path,
+        src_function_name="main",
+        target_function_name="lm_head_flex",
+    )
+    desc.default_function_name = "lm_head_flex"
+    save_multifunction(desc, package_dir)
+
+    return desc
+
+
+def export_embeddings(tensors: Tensors, package_dir: str):
+    embs = tensors["model.embed_tokens.weight"].float().half().numpy()
+    with open(package_dir, "wb") as f:
+        np.save(f, embs, allow_pickle=False)
 
 
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
-    # parser.add_argument("--layer_from", type=int, required=True)
-    # parser.add_argument("--layer_to", type=int, required=True)
+    parser.add_argument("--layer_from", default=0, type=int)
+    parser.add_argument("--layer_to", default=-1, type=int)
+    parser.add_argument("--convert_model", default=False, action="store_true")
+    parser.add_argument("--convert_lm_head", default=False, action="store_true")
+    parser.add_argument("--export_embeddings", default=False, action="store_true")
+    parser.add_argument("--cache_len", default=1024, type=int)
+
+    parser.add_argument("--output_name", default=None)
+
     return parser.parse_args()
 
 
@@ -351,40 +518,58 @@ if __name__ == "__main__":
     tensors_path = os.path.join(args.model_path, "model.safetensors")
     tensors = load_file(tensors_path)
 
-    # mlmodel = convert_lm_head(tensors)
-    # mlmodel.save("falcon-bitnet-lmhead")
+    if args.convert_model:
+        model, config = build_model_from_safetensors(
+            tensors,
+            config,
+            args.layer_from,
+            args.layer_to,
+            max_sequence_length=2048
+            * 4,  # this param is used to build the embeddings and attention mask
+        )
+        mlmodel = convert(
+            model,
+            config,
+            package_dir=args.output_name + ".mlpackage" if args.output_name else None,
+            cache_len=args.cache_len,
+        )
 
-    model, config = build_model_from_safetensors(
-        tensors, config, 0, 6, max_sequence_length=2048
-    )
-    mlmodel = convert(model, config, package_dir="falcon_edge_bitnet_6layers.mlpackage", cache_len=1024)
+    if args.convert_lm_head:
+        lm_head_mlmodel = convert_lm_head(
+            tensors, package_dir=args.output_name + "_lmhead.mlpackage"
+        )
+
+    if args.export_embeddings:
+        export_embeddings(tensors, args.output_name + "_embeddings.npy")
+
     # print(mlmodel._get_mil_internal())
-    print_compute_plan_sync(
-        mlmodel.get_compiled_model_path(), compute_unit=ct.ComputeUnit.CPU_AND_NE
-    )
-    # mlmodel.save("falcon_edge_bitnet")
-    # import torch
-    # from transformers import AutoModel
-    # from transformers.models.llama.modeling_llama import (
-    #     LlamaForCausalLM,
-    #     LlamaDecoderLayer,
+    # print_compute_plan_sync(
+    #     mlmodel.get_compiled_model_path(), compute_unit=ct.ComputeUnit.CPU_AND_NE
     # )
+    # mlmodel.save("falcon_edge_bitnet")
+    import torch
+    from transformers import AutoModel
+    from transformers.models.llama.modeling_llama import (
+        LlamaForCausalLM,
+        LlamaDecoderLayer,
+    )
 
-    # model: LlamaForCausalLM = AutoModel.from_pretrained("tiiuae/Falcon-E-1B-Instruct")
+    torch.random.manual_seed(42)
+    model: LlamaForCausalLM = AutoModel.from_pretrained("tiiuae/Falcon-E-1B-Instruct")
     hidden_states = torch.randn(1, 8, 2048).half()
     hidden_states_np = hidden_states.transpose(-1, -2).unsqueeze(-2).numpy()
 
-    # torch_causal_mask = torch.arange(8)[:, None] <= torch.arange(8)[None, :]
-    # torch_causal_mask = torch_causal_mask[None, None, :, :]
-    # torch_layer: LlamaDecoderLayer = model.layers[0]
-    # position_embeddings = model.rotary_emb(hidden_states, torch.arange(8).unsqueeze(0))
-    # torch_pred = torch_layer(
-    #     hidden_states,
-    #     torch_causal_mask,
-    #     torch.arange(8).unsqueeze(0),
-    #     position_embeddings=position_embeddings,
-    # )
-    # print(torch_pred)
+    torch_causal_mask = torch.arange(8)[:, None] <= torch.arange(8)[None, :]
+    torch_causal_mask = torch_causal_mask[None, None, :, :]
+    torch_layer: LlamaDecoderLayer = model.layers[0]
+    position_embeddings = model.rotary_emb(hidden_states, torch.arange(8).unsqueeze(0))
+    torch_pred = torch_layer(
+        hidden_states,
+        torch_causal_mask,
+        torch.arange(8).unsqueeze(0),
+        position_embeddings=position_embeddings,
+    )
+    print(torch_pred)
 
     state = mlmodel.make_state()
     coreml_pred = mlmodel.predict(

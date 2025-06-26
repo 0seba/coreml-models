@@ -42,5 +42,6 @@ class FalconEdgeBitnetModel(LlamaModel):
         max_sequence_length=8192,
         sin_emb: Optional = None,
         cos_emb: Optional = None,
+        layer_from: int = 0,
     ):
-        super().__init__(blocks, max_sequence_length, sin_emb, cos_emb)
+        super().__init__(blocks, max_sequence_length, sin_emb, cos_emb, layer_from)

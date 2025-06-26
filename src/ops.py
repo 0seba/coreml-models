@@ -6,6 +6,21 @@ from coremltools.converters.mil.mil import types
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
+def build_causal_mask(indices):
+    ones = mb.fill_like(ref_tensor=indices, value=np.array(1, dtype=np.int32), name="mask_ones")
+    arange = mb.cumsum(x=ones, axis=-1, exclusive=True, name="mask_arange")  # exclusive is actually not required
+    mask_left = mb.expand_dims(x=arange, axes=(-1,), name="mask_arange_left")
+    mask_right = mb.expand_dims(x=arange, axes=(-2,), name="mask_arange_right")
+    mask = mb.greater_or_equal(x=mask_left, y=mask_right, name="mask_bool")
+    mask = mb.where(condition=mask, x=np.array(0, dtype=np.float16), y=np.array(-np.inf, dtype=np.float16), name="mask_fp16")
+    if indices.rank == 1:
+        mask = mb.expand_dims(x=mask, axes=(0, 1), name="mask_expand_dims")
+    else:
+        mask = mb.expand_dims(x=mask, axes=(0,), name="mask_expand_dims")
+    return mask
+
+
+
 
 def gather_static(indices, target, prefix, transpose=False):
     values = mb.gather(x=target, indices=indices, axis=0, name=f"{prefix}gather")
@@ -21,7 +36,7 @@ def gather_static(indices, target, prefix, transpose=False):
 
 def build_causal_mask(max_length, boolean=False):
     mask = np.arange(max_length, dtype=np.int32)
-    mask = mask[:, None] <= mask[None, :]
+    mask = mask[:, None] >= mask[None, :]
     if boolean:
         return mask
     return np.where(
@@ -287,17 +302,22 @@ def gqa_attention(
                 x=scores, axis=-2, name=prefix + f"group_{i}_scores_softmax"
             )
             output = mb.matmul(
-                x=vs[groupi],
-                y=scores,
+                x=scores,
+                y=vs[groupi],
                 name=prefix + f"group_{i}_output",
                 transpose_x=True,
             )  # (batch, heads, headdim, source_seqlen)
-            output = mb.reshape(
+            output = mb.transpose(
                 x=output,
-                # shape=[batch_size, group_size * headdim, 1, seqlen],
-                shape=[batch_size, group_size * headdim, 1, -1],
-                name=prefix + f"group_{i}_output_reshaped",
+                perm=[0, 1, 3, 2],
+                name=prefix + f"group_{i}_output_transpose",
             )
+            # output = mb.reshape(
+            #     x=output,
+            #     # shape=[batch_size, group_size * headdim, 1, seqlen],
+            #     shape=[batch_size, group_size * headdim, 1, -1],
+            #     name=prefix + f"group_{i}_output_reshaped",
+            # )
         else:
             raise NotImplementedError()
         per_head_attention.append(output)
