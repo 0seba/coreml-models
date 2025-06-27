@@ -224,7 +224,9 @@ def convert(
         key_cache,
         value_cache,
     ):
-        attention_mask = mb.transpose(x=attention_mask, perm=[0, 1, 3, 2], name="attention_mask_transposed")
+        attention_mask = mb.transpose(
+            x=attention_mask, perm=[0, 1, 3, 2], name="attention_mask_transposed"
+        )
         return model(
             hidden_states,
             positions,
@@ -306,7 +308,7 @@ def convert(
 
 def convert_lm_head(
     tensors: Tensors,
-    chunk_size=16_384,
+    chunk_size=2048,  # chunk size 2048 allows to run .argmax on ANE with uint16 output
     batch_size=1,
     hidden_size=2048,
     package_dir=None,
@@ -347,11 +349,12 @@ def convert_lm_head(
             ),
         ],
         opset_version=mil.builder.AvailableTarget.iOS18,
-        # function_name="min_p",
     )
     def min_p_program(hidden_states, p, temp, random_number):
         hidden_states = final_rms_norm(hidden_states, "final_norm_")
         return min_p(hidden_states, ws, p, temp, random_number)
+
+    print(min_p_program)
 
     @mb.program(
         input_specs=[
@@ -361,20 +364,58 @@ def convert_lm_head(
             ),
         ],
         opset_version=mil.builder.AvailableTarget.iOS18,
-        # function_name="lm_head",
     )
     def lm_head_program(hidden_states):
         hidden_states = final_rms_norm(hidden_states, "final_norm_")
         logits_list = []
+        values_list = []
+        indices_list = []
         for i, w in enumerate(ws):
             logits_chunk = mb.conv(
                 x=hidden_states,
                 weight=w,
                 name=f"logits_chunk_{i}",
             )
+            indices = mb.reduce_argmax(
+                x=logits_chunk,
+                axis=1,
+                keep_dims=True,
+                name=f"argmax_chunk_{i}",
+                output_dtype="uint16",
+            )
+            values = mb.reduce_max(
+                x=logits_chunk, axes=(1,), keep_dims=True, name=f"max_chunk_{i}"
+            )
             logits_list.append(logits_chunk)
+            values_list.append(values)
+            indices_list.append(indices)
         logits = mb.concat(values=logits_list, axis=1, name="logits")
-        return logits
+
+        values = mb.concat(values=values_list, axis=1, name="values")
+        max_value = mb.reduce_max(
+            x=values,
+            axes=(1,),
+            keep_dims=False,
+            name="max_value",
+        )
+        max_value_index = mb.reduce_argmax(
+            x=values,
+            axis=1,
+            keep_dims=True,
+            name="max_value_index",
+        )
+        indices_list = [
+            mb.cast(x=indices, dtype="int32", name=f"indices_chunk_{i}_int32")
+            for i, indices in enumerate(indices_list)
+        ]
+        indices = mb.concat(values=indices_list, axis=1, name="indices")
+        argmax = mb.gather_along_axis(
+            x=indices, axis=1, indices=max_value_index, name="argmax_chunks"
+        )
+        offset = mb.mul(x=chunk_size, y=max_value_index)
+        argmax = mb.add(x=argmax, y=offset, name="argmax")
+
+        return logits, argmax, max_value
 
     pipeline = ct.PassPipeline.DEFAULT
     pipeline.insert_pass(0, "common::materialize_symbolic_shape_program")
@@ -401,13 +442,14 @@ def convert_lm_head(
     PassPipelineManager.apply_pipeline(min_p_program, pipeline)
     min_p_program.export_as_multifunction = True
     min_p_program.skip_all_passes = True
+    min_p_program.functions["main"] = min_p_program.functions["min_p_length_1"]
 
     min_p_mlmodel = ct.convert(
         min_p_program,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS18,
-        skip_model_load=True,
+        skip_model_load=False,
         # pass_pipeline=pipeline,
         # package_dir=package_dir,
         inputs=[
@@ -430,6 +472,7 @@ def convert_lm_head(
         ],
     )
 
+    pipeline = ct.PassPipeline.DEFAULT
     pipeline.insert_pass(0, "common::materialize_symbolic_shape_program")
     pipeline.set_options(
         "common::materialize_symbolic_shape_program",
@@ -454,7 +497,7 @@ def convert_lm_head(
         compute_units=ct.ComputeUnit.CPU_AND_NE,
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS18,
-        skip_model_load=True,
+        skip_model_load=False,
         # package_dir=package_dir,
         inputs=[
             ct.TensorType(
@@ -469,24 +512,30 @@ def convert_lm_head(
         model_path=min_p_mlmodel.package_path,
     )
     desc.remove_function("main")
-    desc.add_function(
-        model_path=min_p_mlmodel.package_path,
-        src_function_name="main",
-        target_function_name="min_p_flex",
-    )
+    # desc.add_function(
+    #     model_path=min_p_mlmodel.package_path,
+    #     src_function_name="main",
+    #     target_function_name="min_p_flex",
+    # )
     desc.add_model(
         model_path=lm_head_mlmodel.package_path,
     )
-    desc.remove_function("main")
-    desc.add_function(
-        model_path=lm_head_mlmodel.package_path,
-        src_function_name="main",
-        target_function_name="lm_head_flex",
-    )
-    desc.default_function_name = "lm_head_flex"
+    # desc.remove_function("main")
+    # desc.add_function(
+    #     model_path=lm_head_mlmodel.package_path,
+    #     src_function_name="main",
+    #     target_function_name="lm_head_flex",
+    # )
+    # desc.default_function_name = "lm_head_flex"
+    desc.default_function_name = "main"
     save_multifunction(desc, package_dir)
+    mlmodel = ct.models.MLModel(
+        package_dir,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        function_name="min_p_length_1",
+    )
 
-    return desc
+    return mlmodel
 
 
 def export_embeddings(tensors: Tensors, package_dir: str):
@@ -538,6 +587,20 @@ if __name__ == "__main__":
         lm_head_mlmodel = convert_lm_head(
             tensors, package_dir=args.output_name + "_lmhead.mlpackage"
         )
+        print_compute_plan_sync(lm_head_mlmodel.get_compiled_model_path())
+        print_compute_plan_sync(
+            lm_head_mlmodel.get_compiled_model_path(), function_name="min_p_length_1"
+        )
+        hidden_states = np.random.normal(size=(1, 2048, 1, 1), scale=0.1)
+        coreml_pred = lm_head_mlmodel.predict(
+            {
+                "hidden_states": hidden_states,
+                "p": np.array([0.1]),
+                "temp": np.array([0.6]),
+                "random_number": np.random.uniform(0.0, 1.0, (1,)),
+            },
+        )
+        print(coreml_pred)
 
     if args.export_embeddings:
         export_embeddings(tensors, args.output_name + "_embeddings.npy")
@@ -547,37 +610,37 @@ if __name__ == "__main__":
     #     mlmodel.get_compiled_model_path(), compute_unit=ct.ComputeUnit.CPU_AND_NE
     # )
     # mlmodel.save("falcon_edge_bitnet")
-    import torch
-    from transformers import AutoModel
-    from transformers.models.llama.modeling_llama import (
-        LlamaForCausalLM,
-        LlamaDecoderLayer,
-    )
+    # import torch
+    # from transformers import AutoModel
+    # from transformers.models.llama.modeling_llama import (
+    #     LlamaForCausalLM,
+    #     LlamaDecoderLayer,
+    # )
 
-    torch.random.manual_seed(42)
-    model: LlamaForCausalLM = AutoModel.from_pretrained("tiiuae/Falcon-E-1B-Instruct")
-    hidden_states = torch.randn(1, 8, 2048).half()
-    hidden_states_np = hidden_states.transpose(-1, -2).unsqueeze(-2).numpy()
+    # torch.random.manual_seed(42)
+    # model: LlamaForCausalLM = AutoModel.from_pretrained("tiiuae/Falcon-E-1B-Instruct")
+    # hidden_states = torch.randn(1, 8, 2048).half()
+    # hidden_states_np = hidden_states.transpose(-1, -2).unsqueeze(-2).numpy()
 
-    torch_causal_mask = torch.arange(8)[:, None] <= torch.arange(8)[None, :]
-    torch_causal_mask = torch_causal_mask[None, None, :, :]
-    torch_layer: LlamaDecoderLayer = model.layers[0]
-    position_embeddings = model.rotary_emb(hidden_states, torch.arange(8).unsqueeze(0))
-    torch_pred = torch_layer(
-        hidden_states,
-        torch_causal_mask,
-        torch.arange(8).unsqueeze(0),
-        position_embeddings=position_embeddings,
-    )
-    print(torch_pred)
+    # torch_causal_mask = torch.arange(8)[:, None] <= torch.arange(8)[None, :]
+    # torch_causal_mask = torch_causal_mask[None, None, :, :]
+    # torch_layer: LlamaDecoderLayer = model.layers[0]
+    # position_embeddings = model.rotary_emb(hidden_states, torch.arange(8).unsqueeze(0))
+    # torch_pred = torch_layer(
+    #     hidden_states,
+    #     torch_causal_mask,
+    #     torch.arange(8).unsqueeze(0),
+    #     position_embeddings=position_embeddings,
+    # )
+    # print(torch_pred)
 
-    state = mlmodel.make_state()
-    coreml_pred = mlmodel.predict(
-        {
-            "hidden_states": hidden_states_np,
-            "kv_write_idx": np.array([0], dtype=np.int32),
-            "positions": np.arange(8, dtype=np.int32)[None, :],
-        },
-        state=state,
-    )
-    print(coreml_pred)
+    # state = mlmodel.make_state()
+    # coreml_pred = mlmodel.predict(
+    #     {
+    #         "hidden_states": hidden_states_np,
+    #         "kv_write_idx": np.array([0], dtype=np.int32),
+    #         "positions": np.arange(8, dtype=np.int32)[None, :],
+    #     },
+    #     state=state,
+    # )
+    # print(coreml_pred)

@@ -6,20 +6,28 @@ from coremltools.converters.mil.mil import types
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
+
 def build_causal_mask(indices):
-    ones = mb.fill_like(ref_tensor=indices, value=np.array(1, dtype=np.int32), name="mask_ones")
-    arange = mb.cumsum(x=ones, axis=-1, exclusive=True, name="mask_arange")  # exclusive is actually not required
+    ones = mb.fill_like(
+        ref_tensor=indices, value=np.array(1, dtype=np.int32), name="mask_ones"
+    )
+    arange = mb.cumsum(
+        x=ones, axis=-1, exclusive=True, name="mask_arange"
+    )  # exclusive is actually not required
     mask_left = mb.expand_dims(x=arange, axes=(-1,), name="mask_arange_left")
     mask_right = mb.expand_dims(x=arange, axes=(-2,), name="mask_arange_right")
     mask = mb.greater_or_equal(x=mask_left, y=mask_right, name="mask_bool")
-    mask = mb.where(condition=mask, x=np.array(0, dtype=np.float16), y=np.array(-np.inf, dtype=np.float16), name="mask_fp16")
+    mask = mb.where(
+        condition=mask,
+        x=np.array(0, dtype=np.float16),
+        y=np.array(-np.inf, dtype=np.float16),
+        name="mask_fp16",
+    )
     if indices.rank == 1:
         mask = mb.expand_dims(x=mask, axes=(0, 1), name="mask_expand_dims")
     else:
         mask = mb.expand_dims(x=mask, axes=(0,), name="mask_expand_dims")
     return mask
-
-
 
 
 def gather_static(indices, target, prefix, transpose=False):
@@ -135,7 +143,9 @@ def update_cache(
         end_mask=[False] * 4,
         squeeze_mask=[False] * 4,
     )
-    cache = mb.coreml_update_state(state=state, value=cache, name=prefix + "update_state")
+    cache = mb.coreml_update_state(
+        state=state, value=cache, name=prefix + "update_state"
+    )
     return cache
 
 
