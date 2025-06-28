@@ -5,6 +5,7 @@ import time
 from transformers import AutoTokenizer
 import shutil
 from argparse import ArgumentParser
+import asyncio
 
 
 def copy_compiled_model(mlmodel: ct.models.MLModel, dest: str):
@@ -33,6 +34,30 @@ def load_mlmodel(path, function_name, copy_compiled):
 
 def load_embeddings(path):
     return np.load(path)
+
+
+async def generate_single_step(
+    input_id,
+    embed_fn,
+    model,
+    state,
+    position,
+    attention_mask_ref,
+    lm_head,
+):
+    embd = embed_fn(input_id).transpose(0, 3, 1, 2)
+    hidden_states = model.predict(
+        {
+            "hidden_states": embd,
+            "kv_write_idx": np.array([position], dtype=np.int32),
+            "positions": np.array([[position]], dtype=np.int32),
+            "attention_mask": attention_mask_ref[:, :, [position]],
+        },
+        state,
+    )["output_hidden_states"]
+    if lm_head is not None:
+        input_id = lm_head(hidden_states)
+        return input_id
 
 
 class ModelContainer:
@@ -73,13 +98,11 @@ class ModelContainer:
         )
         self.tokenizer = AutoTokenizer.from_pretrained(hf_model)
         self.end_of_response_token_id = self.tokenizer("<|im_end|>").input_ids[0]
+        self.end_of_text_token_id = self.tokenizer("<|end_of_text|>").input_ids[0]
+        self.break_tokens = [self.end_of_response_token_id, self.end_of_text_token_id]
 
         self.state = None
         self.position = None
-        self.attention_mask = None
-
-    def initialize_generation(self):
-        self.state = self.generation_model.make_state()
         attention_mask = np.arange(self.cache_length, dtype=np.int32)
         attention_mask = attention_mask[:, None] >= attention_mask[None, :]
         attention_mask = attention_mask[None, None, :, :]
@@ -88,6 +111,9 @@ class ModelContainer:
             np.array(0.0, dtype=np.float16),
             np.array(-np.inf, dtype=np.float16),
         )
+
+    def initialize_generation(self):
+        self.state = self.generation_model.make_state()
         self.position = 0
 
     def load_prompt_model(self):
@@ -112,6 +138,8 @@ class ModelContainer:
         tokens = self.tokenizer.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True
         )
+        if self.position + len(tokens) >= self.cache_length:
+            return np.array([-1])
         stop_processing = False
         start_time = time.perf_counter()
         processed_chunks = 0
@@ -154,7 +182,7 @@ class ModelContainer:
         self.unload_prompt_model()
         end_time = time.perf_counter()
         print(
-            f"==== Processed {processed_chunks * 64} tokens in {end_time - start_time:.2f} seconds, {processed_chunks * 64 / (end_time - start_time):.2f} tokens per second, current position: {self.position}",
+            f"==== Processed {len(tokens)} tokens + {64 - len(chunk)} pad tokens in {end_time - start_time:.2f} seconds, {processed_chunks * 64 / (end_time - start_time):.2f} tokens per second, current position: {self.position}/{self.cache_length}",
         )
         if stop_processing:
             return np.array([-1], dtype=np.int32)
@@ -181,60 +209,69 @@ class ModelContainer:
             ][:, 0]
         return input_id
 
-    def generate(self, input_id: np.array):
-        stop_generation = False
+    async def generate(self, input_id: np.array):
+        continue_generating = True
         # for i in range(max_new_tokens):
-        start_time = time.perf_counter()
         generated_tokens = 0
-        while self.position < self.cache_length:
+        start_time = time.perf_counter()
+        # task = asyncio.create_task(generate_single_step(
+        #     input_id,
+        #     self.embed,
+        #     self.generation_model,
+        #     self.state,
+        #     self.position,
+        #     self.attention_mask,
+        #     self.lm_head,
+        # ))
+
+        while (self.position < self.cache_length) and continue_generating:
             generated_tokens += 1
-            embd = self.embed(input_id).transpose(0, 3, 1, 2)
-            hidden_states = self.generation_model.predict(
-                {
-                    "hidden_states": embd,
-                    "kv_write_idx": np.array([self.position], dtype=np.int32),
-                    "positions": np.array([[self.position]], dtype=np.int32),
-                    "attention_mask": self.attention_mask[:, :, [self.position]],
-                },
-                self.state,
-            )["output_hidden_states"]
-            if stop_generation:
-                print()
-                # print("Loading prompt model...")
-                self.position += 1
-                break
-
-            input_id = self.lm_head(hidden_states)
-
             input_id_item = input_id.item()
-            if input_id_item == self.end_of_response_token_id:
-                stop_generation = True
-            print(self.tokenizer.decode(input_id_item), end="", flush=True)
+            if input_id_item in self.break_tokens:
+                continue_generating = False
+            task = asyncio.create_task(
+                generate_single_step(
+                    input_id,
+                    self.embed,
+                    self.generation_model,
+                    self.state,
+                    self.position,
+                    self.attention_mask,
+                    self.lm_head if continue_generating else None,
+                )
+            )
             self.position += 1
+            print(self.tokenizer.decode(input_id_item), end="", flush=True)
+            input_id = await task
+
+        print()
 
         end_time = time.perf_counter()
         print(
-            f"==== Generated {generated_tokens} tokens in {end_time - start_time:.2f} seconds, {generated_tokens / (end_time - start_time):.2f} tokens per second, current position: {self.position}",
+            f"==== Generated {generated_tokens} tokens in {end_time - start_time:.2f} seconds, {generated_tokens / (end_time - start_time):.2f} tokens per second, current position: {self.position}/{self.cache_length}",
         )
         # if stop_generation:
         #     self.load_prompt_model()
 
     def loop(self):
-        self.initialize_generation()
-        print("Begin conversation...")
+        print("--- Begin conversation ---")
         while True:
-            print(">>> ", end="", flush=True)
-            self.load_prompt_model()
-            prompt = input()
-            prompt_result = self.process_prompt(prompt)
-            if prompt_result.item() == -1:
-                print("\n--- END OF CONVERSATION: MAX CONTEXT LENGTH REACHED ---\n")
-                break
-            print(self.tokenizer.decode(prompt_result.item()), end="", flush=True)
-            self.generate(prompt_result)
-            if self.position >= (self.cache_length):
-                print("\n--- END OF CONVERSATION: MAX CONTEXT LENGTH REACHED ---\n")
-                break
+            self.initialize_generation()
+            while True:
+                print(">>> ", end="", flush=True)
+                self.load_prompt_model()
+                prompt = input()
+                prompt_result = self.process_prompt(prompt)
+                if prompt_result.item() == -1:
+                    print("\n--- END OF CONVERSATION: MAX CONTEXT LENGTH REACHED ---\n")
+                    print("--- Beginning new conversation ---")
+                    break
+                # print(self.tokenizer.decode(prompt_result.item()), end="", flush=True)
+                asyncio.run(self.generate(prompt_result))
+                if self.position >= (self.cache_length):
+                    print("\n--- END OF CONVERSATION: MAX CONTEXT LENGTH REACHED ---\n")
+                    print("--- Beginning new conversation ---")
+                    break
 
 
 def parse_args():
@@ -245,7 +282,7 @@ def parse_args():
     parser.add_argument(
         "--cache_length",
         type=int,
-        choices=[1024, 2048, 2048 + 1024, 4096, 4096 + 2048, 8192],
+        choices=[512, 1024, 2048, 2048 + 1024, 4096, 4096 + 2048, 8192],
         default=1024,
     )
     parser.add_argument("--min_p", type=float, default=0.1)

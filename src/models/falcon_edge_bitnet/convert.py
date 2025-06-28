@@ -596,20 +596,26 @@ if __name__ == "__main__":
         lm_head_mlmodel = convert_lm_head(
             tensors, package_dir=args.output_name + "_lm_head.mlpackage"
         )
-        print_compute_plan_sync(lm_head_mlmodel.get_compiled_model_path())
-        print_compute_plan_sync(
-            lm_head_mlmodel.get_compiled_model_path(), function_name="min_p_length_1"
+        compiled_model_path = mlmodel.get_compiled_model_path()
+        shutil.copytree(
+            compiled_model_path,
+            args.output_name + ".mlmodelc",
+            dirs_exist_ok=True,
         )
-        hidden_states = np.random.normal(size=(1, 2048, 1, 1), scale=0.1)
-        coreml_pred = lm_head_mlmodel.predict(
-            {
-                "hidden_states": hidden_states,
-                "p": np.array([0.1]),
-                "temp": np.array([0.6]),
-                "random_number": np.random.uniform(0.0, 1.0, (1,)),
-            },
-        )
-        print(coreml_pred)
+        # print_compute_plan_sync(lm_head_mlmodel.get_compiled_model_path())
+        # print_compute_plan_sync(
+        #     lm_head_mlmodel.get_compiled_model_path(), function_name="min_p_length_1"
+        # )
+        # hidden_states = np.random.normal(size=(1, 2048, 1, 1), scale=0.1)
+        # coreml_pred = lm_head_mlmodel.predict(
+        #     {
+        #         "hidden_states": hidden_states,
+        #         "p": np.array([0.1]),
+        #         "temp": np.array([0.6]),
+        #         "random_number": np.random.uniform(0.0, 1.0, (1,)),
+        #     },
+        # )
+        # print(coreml_pred)
 
     if args.export_embeddings:
         export_embeddings(tensors, args.output_name + "_embeddings.npy")
