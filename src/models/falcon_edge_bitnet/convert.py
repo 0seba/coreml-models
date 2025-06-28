@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 from typing import Dict, Any
 from argparse import ArgumentParser
 
@@ -227,7 +228,7 @@ def convert(
         attention_mask = mb.transpose(
             x=attention_mask, perm=[0, 1, 3, 2], name="attention_mask_transposed"
         )
-        return model(
+        hidden_states = model(
             hidden_states,
             positions,
             kv_write_idx,
@@ -235,6 +236,8 @@ def convert(
             key_cache,
             value_cache,
         )
+        hidden_states = mb.identity(x=hidden_states, name="output_hidden_states")
+        return hidden_states
 
     pipeline = ct.PassPipeline.DEFAULT
     pipeline.insert_pass(0, "common::materialize_symbolic_shape_program")
@@ -582,10 +585,16 @@ if __name__ == "__main__":
             package_dir=args.output_name + ".mlpackage" if args.output_name else None,
             cache_len=args.cache_len,
         )
+        compiled_model_path = mlmodel.get_compiled_model_path()
+        shutil.copytree(
+            compiled_model_path,
+            args.output_name + ".mlmodelc",
+            dirs_exist_ok=True,
+        )
 
     if args.convert_lm_head:
         lm_head_mlmodel = convert_lm_head(
-            tensors, package_dir=args.output_name + "_lmhead.mlpackage"
+            tensors, package_dir=args.output_name + "_lm_head.mlpackage"
         )
         print_compute_plan_sync(lm_head_mlmodel.get_compiled_model_path())
         print_compute_plan_sync(
