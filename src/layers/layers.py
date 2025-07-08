@@ -6,10 +6,9 @@ from coremltools.converters.mil import Builder as mb
 import coremltools.converters.mil as mil
 from coremltools.converters.mil.mil import Operation, Var, types
 
-from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
-from coremltools.converters.mil.mil.ops.defs.iOS17 import _IOS17_TARGET
-from custom_conv import conv
-
+# from coremltools.converters.mil.mil.ops.defs._op_reqs import register_op
+# from coremltools.converters.mil.mil.ops.defs.iOS17 import _IOS17_TARGET
+# from .custom_conv import conv
 # register_op(conv, opset_version=_IOS17_TARGET, allow_override=True)  #
 
 
